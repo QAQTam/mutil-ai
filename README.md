@@ -26,6 +26,10 @@ SDK 的长期契约、当前实现和交接清单见：
 
 - [`docs/api-freeze-0.1.md`](docs/api-freeze-0.1.md)
 
+下游 gateway / agent 的通用扩展能力登记见：
+
+- [`docs/consumer-capability-requirements.md`](docs/consumer-capability-requirements.md)
+
 ## 1. 核心思想
 
 ### 内部 role
