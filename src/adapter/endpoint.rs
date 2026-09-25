@@ -16,9 +16,11 @@ use super::openai_responses::{
     ResponsesStreamMapper, from_responses_response, to_responses_body, validate_responses_request,
 };
 use super::{
-    ModelAdapter, ReconnectRequest, ReconnectRequestParts, effective_retry_policy,
-    finish_sse_stream, json_body_bytes, merge_extra_body, prepare_headers, protocol_name,
-    send_json_retry, send_stream_retry, validate_profile_selector,
+    ModelAdapter, ReconnectRequest, ReconnectRequestParts, apply_provider_request_options,
+    apply_request_transform, audit_outcome_for_error, completion_report,
+    effective_provider_request_options, effective_retry_policy, finish_sse_stream, json_body_bytes,
+    merge_extra_body, prepare_headers, protocol_name, send_json_retry, send_stream_retry,
+    validate_profile_selector,
 };
 use crate::audit::{AuditContext, ProfileAuditSnapshot};
 use crate::error::{Error, Result};
@@ -27,6 +29,7 @@ use crate::normalize::{NormalizeReport, Protocol, normalize};
 use crate::profile::{
     AuthStyle, Capabilities, EndpointSpec, ModelProfile, ReasoningAliases, ReasoningReplayPolicy,
 };
+use crate::report::CompletionReport;
 use crate::retry::{RetryPolicy, RetryProvider};
 use crate::stream::ModelStream;
 use crate::types::{ChatRequest, ChatResponse, Part, ResponseMetadata};
@@ -234,6 +237,19 @@ impl EndpointAdapter {
                 "tool calling is disabled by the selected profile".to_string(),
             ));
         }
+        if !request.server_tools.is_empty() {
+            if !capabilities.server_side_state {
+                return Err(Error::Unsupported(
+                    "server-side tools are disabled by the selected profile".to_string(),
+                ));
+            }
+            if self.endpoint.protocol != Protocol::OpenAiResponses {
+                return Err(Error::Unsupported(
+                    "the selected protocol does not implement generic server-side tools"
+                        .to_string(),
+                ));
+            }
+        }
         if request.tool_choice.is_some() && !capabilities.tool_choice {
             return Err(Error::Unsupported(
                 "tool choice is disabled by the selected profile".to_string(),
@@ -373,16 +389,26 @@ impl EndpointAdapter {
         Ok((headers, query))
     }
 
+    #[cfg(test)]
     fn build_body(
         &self,
         request: &ChatRequest,
         streaming: bool,
     ) -> Result<(serde_json::Value, NormalizeReport)> {
+        self.build_body_with_options(request, streaming, &RequestOptions::default())
+    }
+
+    fn build_body_with_options(
+        &self,
+        request: &ChatRequest,
+        streaming: bool,
+        options: &RequestOptions,
+    ) -> Result<(serde_json::Value, NormalizeReport)> {
         let profile = self.provider_profile.as_ref();
         let model_profile = self.selected_model_profile();
         let (normalized, report) = normalize(request, self.endpoint.protocol)?;
 
-        match self.endpoint.protocol {
+        let (mut body, report) = match self.endpoint.protocol {
             Protocol::OpenAiChat => {
                 let mut body = to_openai_chat_body_with_profile(
                     &self.model,
@@ -395,7 +421,7 @@ impl EndpointAdapter {
                     body["stream"] = json!(true);
                     body["stream_options"] = json!({"include_usage": true});
                 }
-                Ok((body, report))
+                (body, report)
             }
             Protocol::OpenAiResponses => {
                 validate_responses_request(request)?;
@@ -404,7 +430,7 @@ impl EndpointAdapter {
                 if streaming {
                     body["stream"] = json!(true);
                 }
-                Ok((body, report))
+                (body, report)
             }
             Protocol::AnthropicMessages => {
                 validate_anthropic_request(request)?;
@@ -413,15 +439,24 @@ impl EndpointAdapter {
                 if streaming {
                     body["stream"] = json!(true);
                 }
-                Ok((body, report))
+                (body, report)
             }
             Protocol::GeminiGenerateContent => {
                 validate_gemini_request(request)?;
                 let mut body = to_gemini_body(&normalized, request);
                 merge_extra_body(&mut body, request, Protocol::GeminiGenerateContent, profile)?;
-                Ok((body, report))
+                (body, report)
             }
-        }
+        };
+        let provider_request =
+            effective_provider_request_options(profile, &options.provider_request);
+        apply_provider_request_options(
+            &mut body,
+            self.endpoint.protocol,
+            &provider_request,
+            streaming,
+        )?;
+        Ok((body, report))
     }
 
     fn retry_provider(&self) -> RetryProvider {
@@ -443,11 +478,15 @@ impl EndpointAdapter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn stream_mapper(
         &self,
         response: reqwest::Response,
         policy: Option<crate::stream::StreamReconnectPolicy>,
         reconnect: Option<ReconnectRequest>,
+        cancellation: Option<crate::CancellationToken>,
+        idle_timeout: Option<std::time::Duration>,
+        report: CompletionReport,
         audit: Option<AuditContext>,
     ) -> ModelStream {
         let metadata = ResponseMetadata::from_response(&response);
@@ -458,30 +497,39 @@ impl EndpointAdapter {
                     self.model.clone(),
                     metadata,
                     self.reasoning_aliases(),
-                ),
+                )
+                .with_report(report),
                 policy,
                 reconnect,
+                cancellation,
+                idle_timeout,
                 audit,
             ),
             Protocol::OpenAiResponses => finish_sse_stream(
                 response,
-                ResponsesStreamMapper::new(self.model.clone(), metadata),
+                ResponsesStreamMapper::new(self.model.clone(), metadata).with_report(report),
                 policy,
                 reconnect,
+                cancellation,
+                idle_timeout,
                 audit,
             ),
             Protocol::AnthropicMessages => finish_sse_stream(
                 response,
-                AnthropicStreamMapper::new(self.model.clone(), metadata),
+                AnthropicStreamMapper::new(self.model.clone(), metadata).with_report(report),
                 policy,
                 reconnect,
+                cancellation,
+                idle_timeout,
                 audit,
             ),
             Protocol::GeminiGenerateContent => finish_sse_stream(
                 response,
-                GeminiStreamMapper::new(self.model.clone(), metadata),
+                GeminiStreamMapper::new(self.model.clone(), metadata).with_report(report),
                 policy,
                 reconnect,
+                cancellation,
+                idle_timeout,
                 audit,
             ),
         }
@@ -504,8 +552,11 @@ impl ModelAdapter for EndpointAdapter {
         options: &RequestOptions,
     ) -> Result<ChatResponse> {
         self.ensure_supported()?;
+        let transformed = apply_request_transform(request, options)?;
+        let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
+        let request = transformed.as_ref();
         self.ensure_request_supported(request, false)?;
-        let (body, report) = self.build_body(request, false)?;
+        let (body, report) = self.build_body_with_options(request, false, options)?;
         let request_body_bytes = json_body_bytes(&body)?;
         let (base_headers, query) = self.request_parts(options, false).await?;
         let url = self.endpoint.url_for(&self.model, false)?;
@@ -521,6 +572,9 @@ impl ModelAdapter for EndpointAdapter {
         );
         if let Some(audit) = &audit {
             audit.request_started();
+            if transform_applied {
+                audit.transform_applied();
+            }
             audit.normalization(report.stats());
         }
 
@@ -529,6 +583,7 @@ impl ModelAdapter for EndpointAdapter {
             self.retry_provider(),
             &retry_policy,
             audit.as_ref(),
+            options.cancellation.as_ref(),
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -550,7 +605,7 @@ impl ModelAdapter for EndpointAdapter {
             Err(error) => {
                 if let Some(audit) = &audit {
                     audit.request_finished_with_request_id(
-                        crate::audit::AuditOutcome::Failure,
+                        audit_outcome_for_error(&error),
                         error.status(),
                         error.request_id().map(str::to_string),
                         Some(&error),
@@ -576,6 +631,12 @@ impl ModelAdapter for EndpointAdapter {
                 return Err(error);
             }
         };
+        response.report = completion_report(
+            self.endpoint.protocol,
+            request,
+            report.stats(),
+            transform_applied,
+        );
         if let Some(audit) = &audit {
             audit.request_finished_with_request_id(
                 crate::audit::AuditOutcome::Success,
@@ -595,8 +656,11 @@ impl ModelAdapter for EndpointAdapter {
         options: &RequestOptions,
     ) -> Result<ModelStream> {
         self.ensure_supported()?;
+        let transformed = apply_request_transform(request, options)?;
+        let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
+        let request = transformed.as_ref();
         self.ensure_request_supported(request, true)?;
-        let (body, report) = self.build_body(request, true)?;
+        let (body, report) = self.build_body_with_options(request, true, options)?;
         let request_body_bytes = json_body_bytes(&body)?;
         let (base_headers, query) = self.request_parts(options, true).await?;
         let url = self.endpoint.url_for(&self.model, true)?;
@@ -612,6 +676,9 @@ impl ModelAdapter for EndpointAdapter {
         );
         if let Some(audit) = &audit {
             audit.request_started();
+            if transform_applied {
+                audit.transform_applied();
+            }
             audit.normalization(report.stats());
         }
 
@@ -620,6 +687,7 @@ impl ModelAdapter for EndpointAdapter {
             self.retry_provider(),
             &retry_policy,
             audit.as_ref(),
+            options.cancellation.as_ref(),
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -640,7 +708,7 @@ impl ModelAdapter for EndpointAdapter {
             Err(error) => {
                 if let Some(audit) = &audit {
                     audit.request_finished_with_request_id(
-                        crate::audit::AuditOutcome::Failure,
+                        audit_outcome_for_error(&error),
                         error.status(),
                         error.request_id().map(str::to_string),
                         Some(&error),
@@ -666,7 +734,20 @@ impl ModelAdapter for EndpointAdapter {
                 body,
             })
         });
-        Ok(self.stream_mapper(response, options.stream_reconnect, reconnect, audit))
+        Ok(self.stream_mapper(
+            response,
+            options.stream_reconnect,
+            reconnect,
+            options.cancellation.clone(),
+            options.idle_timeout,
+            completion_report(
+                self.endpoint.protocol,
+                request,
+                report.stats(),
+                transform_applied,
+            ),
+            audit,
+        ))
     }
 }
 

@@ -46,6 +46,8 @@ fn main() {
             Part::ToolCall(call) => println!("tool call: {}", call.name),
             Part::ToolResult(result) => println!("tool result: {}", result.content),
             Part::ImageUrl { image_url } => println!("image: {}", image_url.url),
+            Part::Image { image } => println!("image source: {:?}", image.source),
+            Part::ProviderItem(item) => println!("provider item: {:?}", item.tool),
         }
     }
 }

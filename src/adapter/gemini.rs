@@ -3,13 +3,16 @@ use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 
 use super::{
-    ModelAdapter, ReconnectRequest, ReconnectRequestParts, effective_retry_policy,
+    ModelAdapter, ReconnectRequest, ReconnectRequestParts, apply_provider_request_options,
+    apply_request_transform, audit_outcome_for_error, completion_report, effective_retry_policy,
     finish_sse_stream, json_body_bytes, merge_extra_body, prepare_headers, protocol_name,
-    resolve_api_key, send_json_retry, send_stream_retry, validate_tool_choice,
+    resolve_api_key, send_json_retry, send_stream_retry, validate_server_tools,
+    validate_tool_choice,
 };
 use crate::error::{Error, Result};
 use crate::headers::{RequestOptions, TransportConfig};
 use crate::normalize::{ExternalRole, NormalizedChat, Protocol, normalize};
+use crate::report::CompletionReport;
 use crate::retry::{RetryPolicy, RetryProvider};
 use crate::sse::SseMessage;
 use crate::stream::{ModelStream, SseMapper, StreamEvent};
@@ -87,10 +90,19 @@ impl ModelAdapter for GeminiGenerateContent {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ChatResponse> {
+        let transformed = apply_request_transform(request, options)?;
+        let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
+        let request = transformed.as_ref();
         let (normalized, report) = normalize(request, Protocol::GeminiGenerateContent)?;
         validate_gemini_request(request)?;
         let mut body = to_gemini_body(&normalized, request);
         merge_extra_body(&mut body, request, Protocol::GeminiGenerateContent, None)?;
+        apply_provider_request_options(
+            &mut body,
+            Protocol::GeminiGenerateContent,
+            &options.provider_request,
+            false,
+        )?;
         let request_body_bytes = json_body_bytes(&body)?;
         let key = resolve_api_key(
             self.provider_name(),
@@ -112,6 +124,9 @@ impl ModelAdapter for GeminiGenerateContent {
         );
         if let Some(audit) = &audit {
             audit.request_started();
+            if transform_applied {
+                audit.transform_applied();
+            }
             audit.normalization(report.stats());
         }
 
@@ -122,6 +137,7 @@ impl ModelAdapter for GeminiGenerateContent {
             RetryProvider::Google,
             &retry_policy,
             audit.as_ref(),
+            options.cancellation.as_ref(),
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -148,7 +164,7 @@ impl ModelAdapter for GeminiGenerateContent {
             Err(error) => {
                 if let Some(audit) = &audit {
                     audit.request_finished_with_request_id(
-                        crate::audit::AuditOutcome::Failure,
+                        audit_outcome_for_error(&error),
                         error.status(),
                         error.request_id().map(str::to_string),
                         Some(&error),
@@ -174,6 +190,12 @@ impl ModelAdapter for GeminiGenerateContent {
                 return Err(error);
             }
         };
+        response.report = completion_report(
+            Protocol::GeminiGenerateContent,
+            request,
+            report.stats(),
+            transform_applied,
+        );
         if let Some(audit) = &audit {
             audit.request_finished_with_request_id(
                 crate::audit::AuditOutcome::Success,
@@ -192,10 +214,19 @@ impl ModelAdapter for GeminiGenerateContent {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ModelStream> {
+        let transformed = apply_request_transform(request, options)?;
+        let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
+        let request = transformed.as_ref();
         let (normalized, report) = normalize(request, Protocol::GeminiGenerateContent)?;
         validate_gemini_request(request)?;
         let mut body = to_gemini_body(&normalized, request);
         merge_extra_body(&mut body, request, Protocol::GeminiGenerateContent, None)?;
+        apply_provider_request_options(
+            &mut body,
+            Protocol::GeminiGenerateContent,
+            &options.provider_request,
+            false,
+        )?;
         let request_body_bytes = json_body_bytes(&body)?;
         let key = resolve_api_key(
             self.provider_name(),
@@ -217,6 +248,9 @@ impl ModelAdapter for GeminiGenerateContent {
         );
         if let Some(audit) = &audit {
             audit.request_started();
+            if transform_applied {
+                audit.transform_applied();
+            }
             audit.normalization(report.stats());
         }
 
@@ -237,6 +271,7 @@ impl ModelAdapter for GeminiGenerateContent {
             RetryProvider::Google,
             &retry_policy,
             audit.as_ref(),
+            options.cancellation.as_ref(),
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -257,7 +292,7 @@ impl ModelAdapter for GeminiGenerateContent {
             Err(error) => {
                 if let Some(audit) = &audit {
                     audit.request_finished_with_request_id(
-                        crate::audit::AuditOutcome::Failure,
+                        audit_outcome_for_error(&error),
                         error.status(),
                         error.request_id().map(str::to_string),
                         Some(&error),
@@ -269,7 +304,13 @@ impl ModelAdapter for GeminiGenerateContent {
         };
 
         let metadata = ResponseMetadata::from_response(&response);
-        let mapper = GeminiStreamMapper::new(self.model.clone(), metadata);
+        let mapper =
+            GeminiStreamMapper::new(self.model.clone(), metadata).with_report(completion_report(
+                Protocol::GeminiGenerateContent,
+                request,
+                report.stats(),
+                transform_applied,
+            ));
         let reconnect = options.stream_reconnect.map(|_| {
             ReconnectRequest::new(ReconnectRequestParts {
                 provider: self.provider_name(),
@@ -290,6 +331,8 @@ impl ModelAdapter for GeminiGenerateContent {
             mapper,
             options.stream_reconnect,
             reconnect,
+            options.cancellation.clone(),
+            options.idle_timeout,
             audit,
         ))
     }
@@ -365,7 +408,7 @@ pub(crate) fn to_gemini_body(normalized: &NormalizedChat, request: &ChatRequest)
                         Part::ToolResult(result) => Some(json!({
                             "functionResponse": {
                                 "name": result.name,
-                                "response": tool_response_value(&result.content),
+                                "response": gemini_tool_response(result),
                             }
                         })),
                         _ => None,
@@ -434,6 +477,7 @@ pub(crate) fn to_gemini_body(normalized: &NormalizedChat, request: &ChatRequest)
 }
 
 pub(crate) fn validate_gemini_request(request: &ChatRequest) -> Result<()> {
+    validate_server_tools(Protocol::GeminiGenerateContent, request)?;
     validate_tool_choice(&request.tools, request.tool_choice.as_ref())?;
     if let Some(ResponseFormat::JsonSchema {
         strict: Some(true), ..
@@ -493,9 +537,59 @@ fn gemini_content(parts: &[Part]) -> Vec<Value> {
                     "fileUri": image_url.url,
                 }
             })),
+            Part::Image { image } => Some(gemini_image_part(&image.source)),
             _ => None,
         })
         .collect()
+}
+
+fn gemini_tool_response(result: &crate::types::ToolResult) -> Value {
+    match result.parts.as_slice() {
+        [crate::types::ToolResultPart::Json { value }] => value.clone(),
+        [] => tool_response_value(&result.content),
+        parts => {
+            let mut response = serde_json::Map::new();
+            let mut text = Vec::new();
+            for part in parts {
+                match part {
+                    crate::types::ToolResultPart::Text { text: value } => text.push(value.clone()),
+                    crate::types::ToolResultPart::Json { value } => {
+                        response.insert("json".to_string(), value.clone());
+                    }
+                    crate::types::ToolResultPart::Image { image } => {
+                        response.insert("image".to_string(), gemini_image_part(&image.source));
+                    }
+                }
+            }
+            if !text.is_empty() {
+                response.insert("text".to_string(), Value::String(text.join("\n")));
+            }
+            Value::Object(response)
+        }
+    }
+}
+
+fn gemini_image_part(source: &crate::types::ImageSource) -> Value {
+    match source {
+        crate::types::ImageSource::Url { url } => json!({
+            "fileData": {"fileUri": url},
+        }),
+        crate::types::ImageSource::Base64 { media_type, data } => json!({
+            "inlineData": {
+                "mimeType": media_type,
+                "data": data,
+            },
+        }),
+        crate::types::ImageSource::FileRef { uri, media_type } => {
+            let mut value = json!({
+                "fileData": {"fileUri": uri},
+            });
+            if let Some(media_type) = media_type {
+                value["fileData"]["mimeType"] = json!(media_type);
+            }
+            value
+        }
+    }
 }
 
 fn gemini_thinking(config: Option<&ReasoningConfig>) -> Option<Value> {
@@ -560,6 +654,7 @@ pub(crate) struct GeminiStreamMapper {
     usage: Option<Usage>,
     finish_reason: Option<String>,
     chunks: Vec<Value>,
+    report: CompletionReport,
 }
 
 impl GeminiStreamMapper {
@@ -574,7 +669,13 @@ impl GeminiStreamMapper {
             usage: None,
             finish_reason: None,
             chunks: Vec::new(),
+            report: CompletionReport::default(),
         }
+    }
+
+    pub(crate) fn with_report(mut self, report: CompletionReport) -> Self {
+        self.report = report;
+        self
     }
 
     fn push_start(&mut self, events: &mut Vec<StreamEvent>) {
@@ -680,6 +781,7 @@ impl GeminiStreamMapper {
             usage: self.usage.clone(),
             raw: Value::Array(self.chunks.clone()),
             metadata: Some(self.metadata.clone()),
+            report: self.report.clone(),
         };
         events.push(StreamEvent::Done {
             response: Box::new(response),
@@ -762,6 +864,12 @@ impl SseMapper for GeminiStreamMapper {
                     name: Some(name.clone()),
                     arguments_delta: arguments.to_string(),
                 });
+                events.push(StreamEvent::ToolCallProgress {
+                    index: self.tool_call_index,
+                    id: None,
+                    name: Some(name.clone()),
+                    arguments_so_far: arguments.to_string(),
+                });
                 self.tool_call_index += 1;
                 self.parts.push(GeminiStreamPart::ToolCall {
                     name,
@@ -783,6 +891,11 @@ fn gemini_usage(usage: &Value) -> Option<Usage> {
     Some(Usage {
         input_tokens: usage.get("promptTokenCount").and_then(Value::as_u64),
         output_tokens: usage.get("candidatesTokenCount").and_then(Value::as_u64),
+        total_tokens: usage.get("totalTokenCount").and_then(Value::as_u64),
+        cache_read_tokens: usage.get("cachedContentTokenCount").and_then(Value::as_u64),
+        cache_write_tokens: None,
+        reasoning_tokens: usage.get("thoughtsTokenCount").and_then(Value::as_u64),
+        raw: Some(usage.clone()),
     })
 }
 
@@ -864,6 +977,7 @@ pub(crate) fn from_gemini_response(value: Value) -> Result<ChatResponse> {
         usage,
         raw: value,
         metadata: None,
+        report: CompletionReport::default(),
     })
 }
 

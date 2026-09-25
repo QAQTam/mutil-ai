@@ -5,9 +5,11 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 
 use super::{
-    ModelAdapter, ReconnectRequest, ReconnectRequestParts, effective_retry_policy,
+    ModelAdapter, ReconnectRequest, ReconnectRequestParts, apply_provider_request_options,
+    apply_request_transform, audit_outcome_for_error, completion_report, effective_retry_policy,
     finish_sse_stream, json_body_bytes, merge_extra_body, prepare_headers, protocol_name,
-    resolve_api_key, send_json_retry, send_stream_retry, validate_tool_choice,
+    resolve_api_key, send_json_retry, send_stream_retry, validate_server_tools,
+    validate_tool_choice,
 };
 use crate::error::{Error, Result};
 use crate::headers::{RequestOptions, TransportConfig};
@@ -16,6 +18,7 @@ use crate::profile::{
     MaxTokensSemantics, ModelProfile, ProviderProfile, ReasoningAliases, ReasoningReplayPolicy,
     ThinkingRequestProfile,
 };
+use crate::report::CompletionReport;
 use crate::retry::{RetryPolicy, RetryProvider};
 use crate::sse::SseMessage;
 use crate::stream::{ModelStream, SseMapper, StreamEvent};
@@ -98,8 +101,17 @@ impl ModelAdapter for OpenAIChat {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ChatResponse> {
+        let transformed = apply_request_transform(request, options)?;
+        let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
+        let request = transformed.as_ref();
         let (normalized, report) = normalize(request, Protocol::OpenAiChat)?;
-        let body = to_openai_chat_body(&self.model, &normalized, request, None)?;
+        let mut body = to_openai_chat_body(&self.model, &normalized, request, None)?;
+        apply_provider_request_options(
+            &mut body,
+            Protocol::OpenAiChat,
+            &options.provider_request,
+            false,
+        )?;
         let request_body_bytes = json_body_bytes(&body)?;
         let key = resolve_api_key(
             self.provider_name(),
@@ -118,6 +130,9 @@ impl ModelAdapter for OpenAIChat {
         );
         if let Some(audit) = &audit {
             audit.request_started();
+            if transform_applied {
+                audit.transform_applied();
+            }
             audit.normalization(report.stats());
         }
 
@@ -132,6 +147,7 @@ impl ModelAdapter for OpenAIChat {
             RetryProvider::OpenAi,
             &retry_policy,
             audit.as_ref(),
+            options.cancellation.as_ref(),
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -156,7 +172,7 @@ impl ModelAdapter for OpenAIChat {
             Err(error) => {
                 if let Some(audit) = &audit {
                     audit.request_finished_with_request_id(
-                        crate::audit::AuditOutcome::Failure,
+                        audit_outcome_for_error(&error),
                         error.status(),
                         error.request_id().map(str::to_string),
                         Some(&error),
@@ -182,6 +198,12 @@ impl ModelAdapter for OpenAIChat {
                 return Err(error);
             }
         };
+        response.report = completion_report(
+            Protocol::OpenAiChat,
+            request,
+            report.stats(),
+            transform_applied,
+        );
         if let Some(audit) = &audit {
             audit.request_finished_with_request_id(
                 crate::audit::AuditOutcome::Success,
@@ -200,10 +222,19 @@ impl ModelAdapter for OpenAIChat {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ModelStream> {
+        let transformed = apply_request_transform(request, options)?;
+        let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
+        let request = transformed.as_ref();
         let (normalized, report) = normalize(request, Protocol::OpenAiChat)?;
         let mut body = to_openai_chat_body(&self.model, &normalized, request, None)?;
         body["stream"] = json!(true);
         body["stream_options"] = json!({"include_usage": true});
+        apply_provider_request_options(
+            &mut body,
+            Protocol::OpenAiChat,
+            &options.provider_request,
+            true,
+        )?;
         let request_body_bytes = json_body_bytes(&body)?;
 
         let key = resolve_api_key(
@@ -223,6 +254,9 @@ impl ModelAdapter for OpenAIChat {
         );
         if let Some(audit) = &audit {
             audit.request_started();
+            if transform_applied {
+                audit.transform_applied();
+            }
             audit.normalization(report.stats());
         }
 
@@ -238,6 +272,7 @@ impl ModelAdapter for OpenAIChat {
             RetryProvider::OpenAi,
             &retry_policy,
             audit.as_ref(),
+            options.cancellation.as_ref(),
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -258,7 +293,7 @@ impl ModelAdapter for OpenAIChat {
             Err(error) => {
                 if let Some(audit) = &audit {
                     audit.request_finished_with_request_id(
-                        crate::audit::AuditOutcome::Failure,
+                        audit_outcome_for_error(&error),
                         error.status(),
                         error.request_id().map(str::to_string),
                         Some(&error),
@@ -270,7 +305,14 @@ impl ModelAdapter for OpenAIChat {
         };
 
         let metadata = ResponseMetadata::from_response(&response);
-        let mapper = OpenAiChatStreamMapper::new(self.model.clone(), metadata);
+        let mapper = OpenAiChatStreamMapper::new(self.model.clone(), metadata).with_report(
+            completion_report(
+                Protocol::OpenAiChat,
+                request,
+                report.stats(),
+                transform_applied,
+            ),
+        );
         let reconnect = options.stream_reconnect.map(|_| {
             ReconnectRequest::new(ReconnectRequestParts {
                 provider: self.provider_name(),
@@ -291,6 +333,8 @@ impl ModelAdapter for OpenAIChat {
             mapper,
             options.stream_reconnect,
             reconnect,
+            options.cancellation.clone(),
+            options.idle_timeout,
             audit,
         ))
     }
@@ -351,6 +395,7 @@ pub(crate) fn to_openai_chat_body_with_profile(
     provider: Option<&ProviderProfile>,
     model_profile: Option<&ModelProfile>,
 ) -> Result<Value> {
+    validate_server_tools(Protocol::OpenAiChat, request)?;
     let wire = OpenAiChatWireProfile::resolve(provider, model_profile);
     let mut messages = Vec::new();
 
@@ -777,6 +822,7 @@ pub(crate) struct OpenAiChatStreamMapper {
     usage: Option<Usage>,
     finish_reason: Option<String>,
     chunks: Vec<Value>,
+    report: CompletionReport,
 }
 
 impl OpenAiChatStreamMapper {
@@ -804,7 +850,13 @@ impl OpenAiChatStreamMapper {
             usage: None,
             finish_reason: None,
             chunks: Vec::new(),
+            report: CompletionReport::default(),
         }
+    }
+
+    pub(crate) fn with_report(mut self, report: CompletionReport) -> Self {
+        self.report = report;
+        self
     }
 
     fn push_start(&mut self, events: &mut Vec<StreamEvent>) {
@@ -882,6 +934,7 @@ impl OpenAiChatStreamMapper {
             usage: self.usage.clone(),
             raw: Value::Array(self.chunks.clone()),
             metadata: Some(self.metadata.clone()),
+            report: self.report.clone(),
         };
         events.push(StreamEvent::Done {
             response: Box::new(response),
@@ -1026,11 +1079,22 @@ impl SseMapper for OpenAiChatStreamMapper {
                 }
                 accumulator.arguments.push_str(&arguments_delta);
 
+                let progress_id = accumulator.id.clone().or_else(|| id.clone());
+                let progress_name = (!accumulator.name.is_empty())
+                    .then(|| accumulator.name.clone())
+                    .or_else(|| name.clone());
+                let arguments_so_far = accumulator.arguments.clone();
                 events.push(StreamEvent::ToolCallDelta {
                     index,
                     id,
                     name,
                     arguments_delta,
+                });
+                events.push(StreamEvent::ToolCallProgress {
+                    index,
+                    id: progress_id,
+                    name: progress_name,
+                    arguments_so_far,
                 });
             }
         }
@@ -1160,16 +1224,14 @@ pub(crate) fn from_openai_chat_response_with_aliases(
         }
     }
 
-    let usage = value.get("usage").map(|usage| Usage {
-        input_tokens: usage.get("prompt_tokens").and_then(Value::as_u64),
-        output_tokens: usage.get("completion_tokens").and_then(Value::as_u64),
-    });
+    let usage = value.get("usage").map(openai_chat_usage_value);
 
     Ok(ChatResponse {
         message: Message::new(Role::Assistant, parts),
         usage,
         raw: value,
         metadata: None,
+        report: CompletionReport::default(),
     })
 }
 
@@ -1222,10 +1284,26 @@ fn openai_chat_reasoning_from_detail(detail: &Value) -> Reasoning {
 }
 
 fn openai_chat_usage(usage: &Value) -> Option<Usage> {
-    Some(Usage {
+    Some(openai_chat_usage_value(usage))
+}
+
+fn openai_chat_usage_value(usage: &Value) -> Usage {
+    Usage {
         input_tokens: usage.get("prompt_tokens").and_then(Value::as_u64),
         output_tokens: usage.get("completion_tokens").and_then(Value::as_u64),
-    })
+        total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
+        cache_read_tokens: usage
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64)),
+        cache_write_tokens: usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64),
+        reasoning_tokens: usage
+            .pointer("/completion_tokens_details/reasoning_tokens")
+            .and_then(Value::as_u64),
+        raw: Some(usage.clone()),
+    }
 }
 
 fn parse_json_or_string(value: &str) -> Value {
@@ -1264,10 +1342,20 @@ fn text_content(message: &NormalizedMessage) -> String {
         .join("\n")
 }
 
+fn image_source_url(source: &crate::types::ImageSource) -> String {
+    match source {
+        crate::types::ImageSource::Url { url } => url.clone(),
+        crate::types::ImageSource::Base64 { media_type, data } => {
+            format!("data:{media_type};base64,{data}")
+        }
+        crate::types::ImageSource::FileRef { uri, .. } => uri.clone(),
+    }
+}
+
 fn content_value(parts: &[Part]) -> Value {
     let has_image = parts
         .iter()
-        .any(|part| matches!(part, Part::ImageUrl { .. }));
+        .any(|part| matches!(part, Part::ImageUrl { .. } | Part::Image { .. }));
     if !has_image {
         return Value::String(
             parts
@@ -1291,6 +1379,13 @@ fn content_value(parts: &[Part]) -> Value {
                     "image_url": {
                         "url": image_url.url,
                         "detail": image_url.detail,
+                    }
+                })),
+                Part::Image { image } => Some(json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image_source_url(&image.source),
+                        "detail": image.detail,
                     }
                 })),
                 _ => None,

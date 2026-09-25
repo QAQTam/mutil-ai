@@ -14,10 +14,13 @@ pub enum ErrorKind {
     PermissionDenied,
     NotFound,
     InvalidRequest,
+    ContextLengthExceeded,
+    ContentFiltered,
     RateLimited,
     Overloaded,
     Timeout,
     Connection,
+    Cancelled,
     Decode,
     StreamProtocol,
     ProviderInternal,
@@ -36,10 +39,13 @@ impl ErrorKind {
             Self::PermissionDenied => "permission_denied",
             Self::NotFound => "not_found",
             Self::InvalidRequest => "invalid_request",
+            Self::ContextLengthExceeded => "context_length_exceeded",
+            Self::ContentFiltered => "content_filtered",
             Self::RateLimited => "rate_limited",
             Self::Overloaded => "overloaded",
             Self::Timeout => "timeout",
             Self::Connection => "connection",
+            Self::Cancelled => "cancelled",
             Self::Decode => "decode",
             Self::StreamProtocol => "stream_protocol",
             Self::ProviderInternal => "provider_internal",
@@ -89,6 +95,12 @@ pub enum Error {
 
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
+
+    #[error("request cancelled")]
+    Cancelled,
+
+    #[error("request timed out: {0}")]
+    Timeout(String),
 
     #[error("invalid JSON: {0}")]
     Json(#[from] serde_json::Error),
@@ -182,6 +194,8 @@ impl fmt::Debug for Error {
                 formatter.debug_tuple("MissingApiKey").field(value).finish()
             }
             Self::Http(error) => formatter.debug_tuple("Http").field(error).finish(),
+            Self::Cancelled => formatter.write_str("Cancelled"),
+            Self::Timeout(message) => formatter.debug_tuple("Timeout").field(message).finish(),
             Self::Json(error) => formatter.debug_tuple("Json").field(error).finish(),
             Self::StreamProtocol(value) => formatter
                 .debug_tuple("StreamProtocol")
@@ -269,10 +283,12 @@ impl Error {
         match self {
             Self::MissingApiKey(_) => ErrorKind::Authentication,
             Self::Http(error) => classify_reqwest_error(error),
+            Self::Cancelled => ErrorKind::Cancelled,
+            Self::Timeout(_) => ErrorKind::Timeout,
             Self::Json(_) => ErrorKind::Decode,
             Self::StreamProtocol(_) => ErrorKind::StreamProtocol,
             Self::ProviderStream(_) => ErrorKind::ProviderInternal,
-            Self::Api { status, .. } => classify_status(*status),
+            Self::Api { status, body, .. } => classify_api_error(*status, body),
             Self::MissingModel(_) => ErrorKind::Configuration,
             Self::InvalidRequest(_) => ErrorKind::InvalidRequest,
             Self::Unsupported(_) => ErrorKind::Unsupported,
@@ -440,6 +456,31 @@ fn provider_token(value: &serde_json::Value) -> Option<String> {
         return None;
     }
     Some(token.to_string())
+}
+
+fn classify_api_error(status: u16, body: &str) -> ErrorKind {
+    let info = parse_provider_error(body);
+    let tokens = [
+        info.code.as_deref(),
+        info.error_type.as_deref(),
+        info.status.as_deref(),
+    ];
+    for token in tokens.into_iter().flatten() {
+        match token.to_ascii_lowercase().as_str() {
+            "context_length_exceeded"
+            | "context_length_exceeded_error"
+            | "context_too_long"
+            | "prompt_too_long"
+            | "max_tokens_exceeded" => return ErrorKind::ContextLengthExceeded,
+            "content_filter"
+            | "content_filtered"
+            | "content_policy_violation"
+            | "safety"
+            | "safety_blocked" => return ErrorKind::ContentFiltered,
+            _ => {}
+        }
+    }
+    classify_status(status)
 }
 
 fn classify_status(status: u16) -> ErrorKind {

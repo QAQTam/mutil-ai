@@ -218,6 +218,7 @@ pub enum AuditEvent {
     Normalization {
         stats: NormalizeStats,
     },
+    TransformApplied,
     RetryScheduled {
         attempt: u32,
         next_attempt: u32,
@@ -476,6 +477,12 @@ impl AuditContext {
         self.sink.record(AuditEvent::Normalization { stats });
     }
 
+    pub(crate) fn transform_applied(&self) {
+        if self.config.enabled {
+            self.sink.record(AuditEvent::TransformApplied);
+        }
+    }
+
     pub(crate) fn add_response_bytes(&self, bytes: usize) {
         if !self.config.enabled || bytes == 0 {
             return;
@@ -591,7 +598,12 @@ impl AuditContext {
                 .include_provider_request_id
                 .then_some(provider_request_id)
                 .flatten(),
-            usage: self.config.include_usage.then_some(usage).flatten(),
+            usage: self
+                .config
+                .include_usage
+                .then_some(usage)
+                .flatten()
+                .map(Usage::without_raw),
         });
     }
 

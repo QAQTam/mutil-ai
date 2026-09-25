@@ -12,11 +12,15 @@ use async_trait::async_trait;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 
-use crate::audit::AuditContext;
+use crate::audit::{AuditContext, AuditOutcome};
+use crate::cancel::CancellationToken;
 use crate::error::{Error, Result};
 use crate::headers::{RequestOptions, TransportConfig};
 use crate::normalize::Protocol;
-use crate::profile::{ProfileSelector, ProviderProfile};
+use crate::profile::{
+    ProfileSelector, ProviderProfile, ProviderRequestOptions, ToolCallContentMode,
+};
+use crate::report::{CompletionReport, WireAction, WireFeature};
 use crate::retry::{RetryPolicy, RetryProvider, next_delay, parse_retry_headers};
 use crate::stream::{ModelStream, StreamReconnectPolicy, sse_stream_with_reconnect};
 use crate::types::{ChatRequest, ResponseMetadata, ToolChoice, ToolSpec};
@@ -71,6 +75,15 @@ pub trait ModelAdapter: Send + Sync {
             self.provider_name()
         )))
     }
+}
+
+pub(crate) fn validate_server_tools(protocol: Protocol, request: &ChatRequest) -> Result<()> {
+    if !request.server_tools.is_empty() && protocol != Protocol::OpenAiResponses {
+        return Err(Error::Unsupported(format!(
+            "{protocol:?} does not implement generic server-side tools"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_tool_choice(tools: &[ToolSpec], choice: Option<&ToolChoice>) -> Result<()> {
@@ -230,6 +243,191 @@ pub(crate) fn effective_retry_policy(
     policy
 }
 
+pub(crate) fn audit_outcome_for_error(error: &Error) -> AuditOutcome {
+    if matches!(error, Error::Cancelled) {
+        AuditOutcome::Cancelled
+    } else {
+        AuditOutcome::Failure
+    }
+}
+
+pub(crate) fn effective_provider_request_options(
+    profile: Option<&ProviderProfile>,
+    request: &ProviderRequestOptions,
+) -> ProviderRequestOptions {
+    let mut effective = profile
+        .map(|profile| profile.request_options.clone())
+        .unwrap_or_default();
+    if request.tool_call_content.is_some() {
+        effective.tool_call_content = request.tool_call_content;
+    }
+    if request.require_provider_parameters.is_some() {
+        effective.require_provider_parameters = request.require_provider_parameters;
+    }
+    if request.do_sample.is_some() {
+        effective.do_sample = request.do_sample;
+    }
+    if request.include_stream_usage.is_some() {
+        effective.include_stream_usage = request.include_stream_usage;
+    }
+    if request.prompt_cache_key.is_some() {
+        effective
+            .prompt_cache_key
+            .clone_from(&request.prompt_cache_key);
+    }
+    if request.user.is_some() {
+        effective.user.clone_from(&request.user);
+    }
+    effective
+}
+
+pub(crate) fn apply_provider_request_options(
+    body: &mut Value,
+    protocol: Protocol,
+    options: &ProviderRequestOptions,
+    streaming: bool,
+) -> Result<()> {
+    let body = body.as_object_mut().ok_or_else(|| {
+        Error::InvalidProfile(format!("{protocol:?} request body must be a JSON object"))
+    })?;
+
+    if let Some(prompt_cache_key) = &options.prompt_cache_key
+        && matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses)
+    {
+        body.insert(
+            "prompt_cache_key".to_string(),
+            Value::String(prompt_cache_key.clone()),
+        );
+    }
+    if let Some(user) = &options.user
+        && protocol == Protocol::OpenAiChat
+    {
+        body.insert("user".to_string(), Value::String(user.clone()));
+    }
+    if let Some(do_sample) = options.do_sample {
+        body.insert("do_sample".to_string(), Value::Bool(do_sample));
+    }
+    if let Some(require_provider_parameters) = options.require_provider_parameters {
+        body.insert(
+            "require_provider_parameters".to_string(),
+            Value::Bool(require_provider_parameters),
+        );
+    }
+    if streaming
+        && protocol == Protocol::OpenAiChat
+        && let Some(include_usage) = options.include_stream_usage
+    {
+        let stream_options = body
+            .entry("stream_options".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(stream_options) = stream_options.as_object_mut() {
+            stream_options.insert("include_usage".to_string(), Value::Bool(include_usage));
+        }
+    }
+
+    if protocol == Protocol::OpenAiChat
+        && let Some(mode) = options.tool_call_content
+        && let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut)
+    {
+        for message in messages {
+            if !message.get("tool_calls").is_some_and(Value::is_array) {
+                continue;
+            }
+            match mode {
+                ToolCallContentMode::Auto => {}
+                ToolCallContentMode::Null => {
+                    message["content"] = Value::Null;
+                }
+                ToolCallContentMode::Omit => {
+                    if let Some(message) = message.as_object_mut() {
+                        message.remove("content");
+                    }
+                }
+                ToolCallContentMode::Empty => {
+                    message["content"] = Value::String(String::new());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn apply_request_transform<'a>(
+    request: &'a ChatRequest,
+    options: &RequestOptions,
+) -> Result<std::borrow::Cow<'a, ChatRequest>> {
+    match &options.request_transform {
+        Some(transform) => Ok(std::borrow::Cow::Owned(transform.transform(request)?)),
+        None => Ok(std::borrow::Cow::Borrowed(request)),
+    }
+}
+
+pub(crate) fn completion_report(
+    protocol: Protocol,
+    request: &ChatRequest,
+    normalization: crate::normalize::NormalizeStats,
+    transform_applied: bool,
+) -> CompletionReport {
+    let mut report = CompletionReport::from_normalization(normalization);
+    report.transform_applied = transform_applied;
+    let mut downgraded_tool_results = 0_u32;
+    let mut unsupported_provider_items = 0_u32;
+    let mut unsupported_tool_metadata = 0_u32;
+    for message in &request.messages {
+        for part in &message.parts {
+            match part {
+                crate::types::Part::ToolResult(result) => {
+                    let has_structured = result
+                        .parts
+                        .iter()
+                        .any(|part| !matches!(part, crate::types::ToolResultPart::Text { .. }));
+                    if has_structured
+                        && matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses)
+                    {
+                        downgraded_tool_results += 1;
+                    }
+                    if result.status.is_some() || result.metadata.is_some() {
+                        unsupported_tool_metadata += 1;
+                    }
+                }
+                crate::types::Part::ProviderItem(item)
+                    if item.provider_state.format != protocol.provider_state_format() =>
+                {
+                    unsupported_provider_items += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    if downgraded_tool_results > 0 {
+        report.wire.push(WireAction::Downgraded {
+            feature: WireFeature::StructuredToolResult,
+            to: "text".to_string(),
+            count: downgraded_tool_results,
+        });
+    }
+    if unsupported_provider_items > 0 {
+        report.wire.push(WireAction::Unsupported {
+            feature: WireFeature::ProviderItem,
+            count: unsupported_provider_items,
+        });
+    }
+    if unsupported_tool_metadata > 0 {
+        report.wire.push(WireAction::Unsupported {
+            feature: WireFeature::RequestField,
+            count: unsupported_tool_metadata,
+        });
+    }
+    if !request.server_tools.is_empty() && protocol != Protocol::OpenAiResponses {
+        report.wire.push(WireAction::Unsupported {
+            feature: WireFeature::ServerTool,
+            count: request.server_tools.len() as u32,
+        });
+    }
+    report
+}
+
 pub(crate) struct ReconnectRequest {
     provider: &'static str,
     client: reqwest::Client,
@@ -292,11 +490,13 @@ impl ReconnectRequest {
         let body = self.body.clone();
 
         Box::pin(async move {
+            let cancellation = options.cancellation.clone();
             send_stream_retry(
                 provider,
                 retry_provider,
                 &retry_policy,
                 audit.as_ref(),
+                cancellation.as_ref(),
                 || async {
                     let mut headers = prepare_headers(&transport, &base_headers, &options).await?;
                     if let Some(last_event_id) = &last_event_id {
@@ -323,6 +523,8 @@ pub(crate) fn finish_sse_stream<M>(
     mapper: M,
     policy: Option<StreamReconnectPolicy>,
     reconnect: Option<ReconnectRequest>,
+    cancellation: Option<CancellationToken>,
+    idle_timeout: Option<std::time::Duration>,
     audit: Option<AuditContext>,
 ) -> ModelStream
 where
@@ -334,9 +536,17 @@ where
             mapper,
             policy,
             move |last_event_id| reconnect.connect(last_event_id),
+            cancellation,
+            idle_timeout,
             audit,
         ),
-        _ => crate::stream::sse_stream_with_audit(response, mapper, audit),
+        _ => crate::stream::sse_stream_with_audit(
+            response,
+            mapper,
+            cancellation,
+            idle_timeout,
+            audit,
+        ),
     }
 }
 
@@ -347,8 +557,9 @@ pub(crate) async fn send_json(
     audit: Option<&AuditContext>,
     attempt: u32,
     attempt_started: Instant,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<(Value, ResponseMetadata)> {
-    let response = request.send().await?;
+    let response = send_request(request, cancellation).await?;
     let metadata = ResponseMetadata::from_response(&response);
     let status = response.status();
     if let Some(audit) = audit {
@@ -363,7 +574,7 @@ pub(crate) async fn send_json(
     let retry_directive = parse_retry_headers(retry_provider, response.headers());
     let retry_after = retry_directive.map(|directive| directive.delay);
     let retry_source = retry_directive.map(|directive| directive.source);
-    let text = response.text().await?;
+    let text = read_response_text(response, cancellation).await?;
     if let Some(audit) = audit {
         audit.add_response_bytes(text.len());
     }
@@ -383,11 +594,88 @@ pub(crate) async fn send_json(
     Ok((value, metadata))
 }
 
+async fn send_request(
+    request: reqwest::RequestBuilder,
+    cancellation: Option<&CancellationToken>,
+) -> Result<reqwest::Response> {
+    if let Some(cancellation) = cancellation {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(Error::Cancelled),
+            response = request.send() => response.map_err(Error::from),
+        }
+    } else {
+        request.send().await.map_err(Error::from)
+    }
+}
+
+async fn read_response_text(
+    response: reqwest::Response,
+    cancellation: Option<&CancellationToken>,
+) -> Result<String> {
+    if let Some(cancellation) = cancellation {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(Error::Cancelled),
+            text = response.text() => text.map_err(Error::from),
+        }
+    } else {
+        response.text().await.map_err(Error::from)
+    }
+}
+
+async fn sleep_or_cancel(
+    delay: std::time::Duration,
+    cancellation: Option<&CancellationToken>,
+) -> Result<()> {
+    if let Some(cancellation) = cancellation {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(Error::Cancelled),
+            _ = tokio::time::sleep(delay) => Ok(()),
+        }
+    } else {
+        tokio::time::sleep(delay).await;
+        Ok(())
+    }
+}
+
+async fn build_request_or_cancel<Fut>(
+    future: Fut,
+    cancellation: Option<&CancellationToken>,
+) -> Result<reqwest::RequestBuilder>
+where
+    Fut: Future<Output = Result<reqwest::RequestBuilder>>,
+{
+    if let Some(cancellation) = cancellation {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(Error::Cancelled),
+            request = future => request,
+        }
+    } else {
+        future.await
+    }
+}
+
 pub(crate) async fn send_json_retry<F, Fut>(
     provider: &'static str,
     retry_provider: RetryProvider,
     policy: &RetryPolicy,
     audit: Option<&AuditContext>,
+    cancellation: Option<&CancellationToken>,
     mut make_request: F,
 ) -> Result<(Value, ResponseMetadata)>
 where
@@ -401,11 +689,14 @@ where
     }
 
     for attempt in 0..policy.max_attempts {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(Error::Cancelled);
+        }
         if let Some(audit) = audit {
             audit.attempt_started(attempt);
         }
         let attempt_started = Instant::now();
-        let request = match make_request().await {
+        let request = match build_request_or_cancel(make_request(), cancellation).await {
             Ok(request) => request,
             Err(error) => {
                 if let Some(audit) = audit {
@@ -423,7 +714,7 @@ where
                 if let Some(audit) = audit {
                     audit.retry_scheduled(attempt, attempt + 1, delay, &error);
                 }
-                tokio::time::sleep(delay).await;
+                sleep_or_cancel(delay, cancellation).await?;
                 continue;
             }
         };
@@ -435,6 +726,7 @@ where
             audit,
             attempt,
             attempt_started,
+            cancellation,
         )
         .await
         {
@@ -466,7 +758,7 @@ where
                 if let Some(audit) = audit {
                     audit.retry_scheduled(attempt, attempt + 1, delay, &error);
                 }
-                tokio::time::sleep(delay).await;
+                sleep_or_cancel(delay, cancellation).await?;
             }
         }
     }
@@ -479,6 +771,7 @@ pub(crate) async fn send_stream_retry<F, Fut>(
     retry_provider: RetryProvider,
     policy: &RetryPolicy,
     audit: Option<&AuditContext>,
+    cancellation: Option<&CancellationToken>,
     mut make_request: F,
 ) -> Result<reqwest::Response>
 where
@@ -492,11 +785,14 @@ where
     }
 
     for attempt in 0..policy.max_attempts {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(Error::Cancelled);
+        }
         if let Some(audit) = audit {
             audit.attempt_started(attempt);
         }
         let attempt_started = Instant::now();
-        let request = match make_request().await {
+        let request = match build_request_or_cancel(make_request(), cancellation).await {
             Ok(request) => request,
             Err(error) => {
                 if let Some(audit) = audit {
@@ -514,15 +810,14 @@ where
                 if let Some(audit) = audit {
                     audit.retry_scheduled(attempt, attempt + 1, delay, &error);
                 }
-                tokio::time::sleep(delay).await;
+                sleep_or_cancel(delay, cancellation).await?;
                 continue;
             }
         };
 
-        let response = match request.send().await {
+        let response = match send_request(request, cancellation).await {
             Ok(response) => response,
             Err(error) => {
-                let error = Error::Http(error);
                 if let Some(audit) = audit {
                     audit.attempt_finished_with_request_id(
                         attempt,
@@ -538,7 +833,7 @@ where
                 if let Some(audit) = audit {
                     audit.retry_scheduled(attempt, attempt + 1, delay, &error);
                 }
-                tokio::time::sleep(delay).await;
+                sleep_or_cancel(delay, cancellation).await?;
                 continue;
             }
         };
@@ -591,7 +886,7 @@ where
         let retry_after = retry_directive.map(|directive| directive.delay);
         let retry_source = retry_directive.map(|directive| directive.source);
         let request_id = ResponseMetadata::from_response(&response).request_id;
-        let body = response.text().await?;
+        let body = read_response_text(response, cancellation).await?;
         if let Some(audit) = audit {
             audit.add_response_bytes(body.len());
         }
@@ -619,7 +914,7 @@ where
         if let Some(audit) = audit {
             audit.retry_scheduled(attempt, attempt + 1, delay, &error);
         }
-        tokio::time::sleep(delay).await;
+        sleep_or_cancel(delay, cancellation).await?;
     }
 
     unreachable!("the loop returns on success or on the final error")

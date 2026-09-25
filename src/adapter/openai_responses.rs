@@ -5,13 +5,15 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 
 use super::{
-    ModelAdapter, ReconnectRequest, ReconnectRequestParts, effective_retry_policy,
+    ModelAdapter, ReconnectRequest, ReconnectRequestParts, apply_provider_request_options,
+    apply_request_transform, audit_outcome_for_error, completion_report, effective_retry_policy,
     finish_sse_stream, json_body_bytes, merge_extra_body, prepare_headers, protocol_name,
     resolve_api_key, send_json_retry, send_stream_retry, validate_tool_choice,
 };
 use crate::error::{Error, Result};
 use crate::headers::{RequestOptions, TransportConfig};
 use crate::normalize::{ExternalRole, NormalizedChat, Protocol, normalize};
+use crate::report::CompletionReport;
 use crate::retry::{RetryPolicy, RetryProvider};
 use crate::sse::SseMessage;
 use crate::stream::{ModelStream, SseMapper, StreamEvent};
@@ -79,10 +81,19 @@ impl ModelAdapter for OpenAIResponses {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ChatResponse> {
+        let transformed = apply_request_transform(request, options)?;
+        let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
+        let request = transformed.as_ref();
         let (normalized, report) = normalize(request, Protocol::OpenAiResponses)?;
         validate_responses_request(request)?;
         let mut body = to_responses_body(&self.model, &normalized, request);
         merge_extra_body(&mut body, request, Protocol::OpenAiResponses, None)?;
+        apply_provider_request_options(
+            &mut body,
+            Protocol::OpenAiResponses,
+            &options.provider_request,
+            false,
+        )?;
         let request_body_bytes = json_body_bytes(&body)?;
         let key = resolve_api_key(
             self.provider_name(),
@@ -101,6 +112,9 @@ impl ModelAdapter for OpenAIResponses {
         );
         if let Some(audit) = &audit {
             audit.request_started();
+            if transform_applied {
+                audit.transform_applied();
+            }
             audit.normalization(report.stats());
         }
 
@@ -115,6 +129,7 @@ impl ModelAdapter for OpenAIResponses {
             RetryProvider::OpenAi,
             &retry_policy,
             audit.as_ref(),
+            options.cancellation.as_ref(),
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -136,7 +151,7 @@ impl ModelAdapter for OpenAIResponses {
             Err(error) => {
                 if let Some(audit) = &audit {
                     audit.request_finished_with_request_id(
-                        crate::audit::AuditOutcome::Failure,
+                        audit_outcome_for_error(&error),
                         error.status(),
                         error.request_id().map(str::to_string),
                         Some(&error),
@@ -162,6 +177,12 @@ impl ModelAdapter for OpenAIResponses {
                 return Err(error);
             }
         };
+        response.report = completion_report(
+            Protocol::OpenAiResponses,
+            request,
+            report.stats(),
+            transform_applied,
+        );
         if let Some(audit) = &audit {
             audit.request_finished_with_request_id(
                 crate::audit::AuditOutcome::Success,
@@ -180,11 +201,20 @@ impl ModelAdapter for OpenAIResponses {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ModelStream> {
+        let transformed = apply_request_transform(request, options)?;
+        let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
+        let request = transformed.as_ref();
         let (normalized, report) = normalize(request, Protocol::OpenAiResponses)?;
         validate_responses_request(request)?;
         let mut body = to_responses_body(&self.model, &normalized, request);
         merge_extra_body(&mut body, request, Protocol::OpenAiResponses, None)?;
         body["stream"] = json!(true);
+        apply_provider_request_options(
+            &mut body,
+            Protocol::OpenAiResponses,
+            &options.provider_request,
+            true,
+        )?;
         let request_body_bytes = json_body_bytes(&body)?;
 
         let key = resolve_api_key(
@@ -204,6 +234,9 @@ impl ModelAdapter for OpenAIResponses {
         );
         if let Some(audit) = &audit {
             audit.request_started();
+            if transform_applied {
+                audit.transform_applied();
+            }
             audit.normalization(report.stats());
         }
 
@@ -219,6 +252,7 @@ impl ModelAdapter for OpenAIResponses {
             RetryProvider::OpenAi,
             &retry_policy,
             audit.as_ref(),
+            options.cancellation.as_ref(),
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -239,7 +273,7 @@ impl ModelAdapter for OpenAIResponses {
             Err(error) => {
                 if let Some(audit) = &audit {
                     audit.request_finished_with_request_id(
-                        crate::audit::AuditOutcome::Failure,
+                        audit_outcome_for_error(&error),
                         error.status(),
                         error.request_id().map(str::to_string),
                         Some(&error),
@@ -251,7 +285,14 @@ impl ModelAdapter for OpenAIResponses {
         };
 
         let metadata = ResponseMetadata::from_response(&response);
-        let mapper = ResponsesStreamMapper::new(self.model.clone(), metadata);
+        let mapper = ResponsesStreamMapper::new(self.model.clone(), metadata).with_report(
+            completion_report(
+                Protocol::OpenAiResponses,
+                request,
+                report.stats(),
+                transform_applied,
+            ),
+        );
         let reconnect = options.stream_reconnect.map(|_| {
             ReconnectRequest::new(ReconnectRequestParts {
                 provider: self.provider_name(),
@@ -272,6 +313,8 @@ impl ModelAdapter for OpenAIResponses {
             mapper,
             options.stream_reconnect,
             reconnect,
+            options.cancellation.clone(),
+            options.idle_timeout,
             audit,
         ))
     }
@@ -320,6 +363,12 @@ pub(crate) fn to_responses_body(
                                     .unwrap_or_else(|_| "{}".to_string()),
                             }));
                         }
+                        Part::ProviderItem(item)
+                            if item.provider_state.format
+                                == ProviderStateFormat::OpenAiResponses =>
+                        {
+                            input.push(item.provider_state.data.clone());
+                        }
                         _ => {}
                     }
                 }
@@ -347,21 +396,21 @@ pub(crate) fn to_responses_body(
     if let Some(system) = &normalized.system {
         body["instructions"] = json!(system);
     }
-    if !normalized.tools.is_empty() {
-        body["tools"] = Value::Array(
-            normalized
-                .tools
-                .iter()
-                .map(|tool| {
-                    json!({
-                        "type": "function",
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    })
-                })
-                .collect(),
-        );
+    let mut tools = normalized
+        .tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            })
+        })
+        .collect::<Vec<_>>();
+    tools.extend(request.server_tools.iter().map(responses_server_tool));
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools);
     }
     if let Some(temperature) = request.temperature {
         body["temperature"] = json!(temperature);
@@ -447,6 +496,7 @@ enum ResponsesPartAccumulator {
         arguments: String,
         item: Option<Value>,
     },
+    ProviderItem(Value),
 }
 
 pub(crate) struct ResponsesStreamMapper {
@@ -459,6 +509,7 @@ pub(crate) struct ResponsesStreamMapper {
     finish_reason: Option<String>,
     final_response: Option<ChatResponse>,
     chunks: Vec<Value>,
+    report: CompletionReport,
 }
 
 impl ResponsesStreamMapper {
@@ -473,7 +524,13 @@ impl ResponsesStreamMapper {
             finish_reason: None,
             final_response: None,
             chunks: Vec::new(),
+            report: CompletionReport::default(),
         }
+    }
+
+    pub(crate) fn with_report(mut self, report: CompletionReport) -> Self {
+        self.report = report;
+        self
     }
 
     fn push_start(&mut self, events: &mut Vec<StreamEvent>) {
@@ -576,6 +633,7 @@ impl ResponsesStreamMapper {
 
         let mut normalized = from_responses_response(response.clone())?;
         normalized.metadata = Some(self.metadata.clone());
+        normalized.report = self.report.clone();
         self.usage = normalized.usage.clone();
         self.finish_reason = response
             .get("incomplete_details")
@@ -661,6 +719,9 @@ impl ResponsesStreamMapper {
                         provider_state: None,
                     }));
                 }
+                ResponsesPartAccumulator::ProviderItem(item) => {
+                    parts.push(Part::ProviderItem(responses_server_tool_item(&item)));
+                }
             }
         }
 
@@ -669,6 +730,7 @@ impl ResponsesStreamMapper {
             usage: self.usage.clone(),
             raw: Value::Array(self.chunks.clone()),
             metadata: Some(self.metadata.clone()),
+            report: self.report.clone(),
         };
         self.done = true;
         events.push(StreamEvent::Done {
@@ -758,6 +820,10 @@ impl SseMapper for ResponsesStreamMapper {
                         .and_then(Value::as_u64)
                         .unwrap_or(0) as usize;
                     self.tool_call_mut(output_index).2.push_str(delta);
+                    let (call_id, name, arguments, _) = self.tool_call_mut(output_index);
+                    let progress_id = call_id.clone();
+                    let progress_name = (!name.is_empty()).then(|| name.clone());
+                    let arguments_so_far = arguments.clone();
                     events.push(StreamEvent::ToolCallDelta {
                         index: output_index,
                         id: event
@@ -766,6 +832,12 @@ impl SseMapper for ResponsesStreamMapper {
                             .map(str::to_string),
                         name: None,
                         arguments_delta: delta.to_string(),
+                    });
+                    events.push(StreamEvent::ToolCallProgress {
+                        index: output_index,
+                        id: progress_id,
+                        name: progress_name,
+                        arguments_so_far,
                     });
                 }
             }
@@ -799,6 +871,13 @@ impl SseMapper for ResponsesStreamMapper {
                     }
                     Some("reasoning") => {
                         *self.reasoning_mut(output_index).2 = Some(item.clone());
+                    }
+                    Some(kind) if is_responses_server_item(kind) => {
+                        self.parts.insert(
+                            output_index,
+                            ResponsesPartAccumulator::ProviderItem(item.clone()),
+                        );
+                        events.push(server_tool_status_event(item));
                     }
                     _ => {}
                 }
@@ -847,6 +926,13 @@ impl SseMapper for ResponsesStreamMapper {
                                 }
                             }
                         }
+                    }
+                    Some(kind) if is_responses_server_item(kind) => {
+                        self.parts.insert(
+                            output_index,
+                            ResponsesPartAccumulator::ProviderItem(item.clone()),
+                        );
+                        events.push(server_tool_status_event(item));
                     }
                     _ => {}
                 }
@@ -909,6 +995,9 @@ pub(crate) fn from_responses_response(value: Value) -> Result<ChatResponse> {
                         provider_state: None,
                     }));
                 }
+                Some(kind) if is_responses_server_item(kind) => {
+                    parts.push(Part::ProviderItem(responses_server_tool_item(item)));
+                }
                 _ => {}
             }
         }
@@ -921,7 +1010,75 @@ pub(crate) fn from_responses_response(value: Value) -> Result<ChatResponse> {
         usage,
         raw: value,
         metadata: None,
+        report: CompletionReport::default(),
     })
+}
+
+fn is_responses_server_item(kind: &str) -> bool {
+    matches!(
+        kind,
+        "web_search_call"
+            | "url_context_call"
+            | "file_search_call"
+            | "computer_call"
+            | "code_interpreter_call"
+            | "image_generation_call"
+            | "mcp_call"
+    )
+}
+
+fn responses_server_tool_item(item: &Value) -> crate::types::ServerToolItem {
+    let kind = item.get("type").and_then(Value::as_str);
+    let call_id = item
+        .get("call_id")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("id").and_then(Value::as_str))
+        .map(str::to_string);
+    let state = item
+        .get("status")
+        .and_then(Value::as_str)
+        .map(responses_server_tool_state);
+    crate::types::ServerToolItem {
+        tool: kind.map(|kind| kind.trim_end_matches("_call").to_string()),
+        call_id,
+        state,
+        provider_state: ProviderState::new(ProviderStateFormat::OpenAiResponses, item.clone()),
+    }
+}
+
+fn server_tool_status_event(item: &Value) -> StreamEvent {
+    let item = responses_server_tool_item(item);
+    StreamEvent::ServerToolStatus {
+        tool: item.tool.unwrap_or_else(|| "unknown".to_string()),
+        call_id: item.call_id,
+        state: item.state.unwrap_or(crate::types::ServerToolState::Unknown),
+    }
+}
+
+fn responses_server_tool_state(status: &str) -> crate::types::ServerToolState {
+    match status {
+        "in_progress" | "searching" | "running" => crate::types::ServerToolState::InProgress,
+        "completed" | "succeeded" => crate::types::ServerToolState::Completed,
+        "failed" | "incomplete" => crate::types::ServerToolState::Failed,
+        _ => crate::types::ServerToolState::Unknown,
+    }
+}
+
+fn responses_server_tool(tool: &crate::types::ServerTool) -> Value {
+    match tool {
+        crate::types::ServerTool::WebSearch => json!({"type": "web_search"}),
+        crate::types::ServerTool::UrlContext => json!({"type": "url_context"}),
+        crate::types::ServerTool::FileSearch => json!({"type": "file_search"}),
+        crate::types::ServerTool::Custom { name, config } => {
+            let mut value = config.clone();
+            if let Some(object) = value.as_object_mut() {
+                object.insert("name".to_string(), Value::String(name.clone()));
+                value
+            } else {
+                json!({"type": name, "config": config})
+            }
+        }
+    }
 }
 
 fn responses_reasoning_part(item: &Value) -> Reasoning {
@@ -971,6 +1128,17 @@ fn responses_usage(usage: &Value) -> Usage {
     Usage {
         input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
         output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
+        total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
+        cache_read_tokens: usage
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(Value::as_u64),
+        cache_write_tokens: usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64),
+        reasoning_tokens: usage
+            .pointer("/output_tokens_details/reasoning_tokens")
+            .and_then(Value::as_u64),
+        raw: Some(usage.clone()),
     }
 }
 
@@ -1025,10 +1193,20 @@ fn text_content(message: &crate::normalize::NormalizedMessage) -> String {
         .join("\n")
 }
 
+fn image_source_url(source: &crate::types::ImageSource) -> String {
+    match source {
+        crate::types::ImageSource::Url { url } => url.clone(),
+        crate::types::ImageSource::Base64 { media_type, data } => {
+            format!("data:{media_type};base64,{data}")
+        }
+        crate::types::ImageSource::FileRef { uri, .. } => uri.clone(),
+    }
+}
+
 fn responses_content_value(parts: &[Part]) -> Value {
     let has_image = parts
         .iter()
-        .any(|part| matches!(part, Part::ImageUrl { .. }));
+        .any(|part| matches!(part, Part::ImageUrl { .. } | Part::Image { .. }));
     if !has_image {
         return Value::String(
             parts
@@ -1050,6 +1228,10 @@ fn responses_content_value(parts: &[Part]) -> Value {
                 Part::ImageUrl { image_url } => Some(json!({
                     "type": "input_image",
                     "image_url": image_url.url,
+                })),
+                Part::Image { image } => Some(json!({
+                    "type": "input_image",
+                    "image_url": image_source_url(&image.source),
                 })),
                 _ => None,
             })

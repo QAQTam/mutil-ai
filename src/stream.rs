@@ -8,9 +8,10 @@ use bytes::Bytes;
 use futures_core::Stream;
 
 use crate::audit::{AuditContext, AuditOutcome, FirstTokenKind};
-use crate::error::{Error, Result};
+use crate::cancel::CancellationToken;
+use crate::error::{Error, ErrorKind, Result};
 use crate::sse::{SseError, SseEvent, SseMessage, SseParser};
-use crate::types::{ChatResponse, ReasoningKind, ResponseMetadata, Usage};
+use crate::types::{ChatResponse, ReasoningKind, ResponseMetadata, ServerToolState, Usage};
 
 /// A boxed provider-neutral stream of model events.
 pub type ModelStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send + 'static>>;
@@ -77,10 +78,32 @@ pub enum StreamEvent {
         name: Option<String>,
         arguments_delta: String,
     },
+    /// The complete tool arguments accumulated so far for a call.
+    ToolCallProgress {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        arguments_so_far: String,
+    },
+    /// A provider-hosted or built-in tool changed state.
+    ServerToolStatus {
+        tool: String,
+        call_id: Option<String>,
+        state: ServerToolState,
+    },
     /// Usage reported during the stream. Providers may send this only at the end.
     Usage { usage: Usage },
-    /// A server-directed SSE retry delay or a scheduled stream reconnect.
+    /// A server-directed SSE retry delay.
     Retry { delay: Duration },
+    /// The SDK scheduled a retry or reconnect with stable metadata.
+    Retrying {
+        attempt: u32,
+        max_attempts: u32,
+        delay: Duration,
+        reason: String,
+    },
+    /// A recoverable stream error. Terminal errors are returned as `Err`.
+    Error { error: StreamError },
     /// The stream completed and the SDK assembled a normal response.
     ///
     /// Consumers that persist conversation history should append
@@ -89,6 +112,14 @@ pub enum StreamEvent {
         response: Box<ChatResponse>,
         finish_reason: Option<String>,
     },
+}
+
+/// Stable, content-free metadata for a recoverable stream error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamError {
+    pub kind: ErrorKind,
+    pub message: String,
+    pub recoverable: bool,
 }
 
 /// Provider-specific mapper from one SSE message to zero or more events.
@@ -108,12 +139,15 @@ pub(crate) trait SseMapper: Send + Unpin + 'static {
 pub(crate) fn sse_stream_with_audit<M>(
     response: reqwest::Response,
     mapper: M,
+    cancellation: Option<CancellationToken>,
+    idle_timeout: Option<Duration>,
     audit: Option<AuditContext>,
 ) -> ModelStream
 where
     M: SseMapper,
 {
     let metadata = ResponseMetadata::from_response(&response);
+    let cancellation_future = cancellation_future(cancellation.clone());
     Box::pin(SseStream {
         inner: Box::pin(response.bytes_stream()),
         parser: SseParser::new(),
@@ -126,11 +160,31 @@ where
         seen_order: VecDeque::new(),
         reconnect: None,
         reconnect_future: None,
+        cancellation,
+        cancellation_future,
+        idle_timeout,
+        idle_deadline: idle_deadline(idle_timeout),
         audit,
         audit_finished: false,
         audit_status: Some(metadata.status),
         audit_provider_request_id: metadata.request_id,
     })
+}
+
+type CancellationFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+fn cancellation_future(cancellation: Option<CancellationToken>) -> Option<CancellationFuture> {
+    cancellation.map(|cancellation| {
+        Box::pin(async move {
+            cancellation.cancelled().await;
+        }) as CancellationFuture
+    })
+}
+
+type IdleDeadline = Pin<Box<tokio::time::Sleep>>;
+
+fn idle_deadline(timeout: Option<Duration>) -> Option<IdleDeadline> {
+    timeout.map(|timeout| Box::pin(tokio::time::sleep(timeout)))
 }
 
 type ReconnectFuture = Pin<Box<dyn Future<Output = Result<reqwest::Response>> + Send>>;
@@ -159,6 +213,8 @@ pub(crate) fn sse_stream_with_reconnect<M, F>(
     mapper: M,
     policy: StreamReconnectPolicy,
     factory: F,
+    cancellation: Option<CancellationToken>,
+    idle_timeout: Option<Duration>,
     audit: Option<AuditContext>,
 ) -> ModelStream
 where
@@ -166,6 +222,7 @@ where
     F: FnMut(Option<String>) -> ReconnectFuture + Send + 'static,
 {
     let metadata = ResponseMetadata::from_response(&response);
+    let cancellation_future = cancellation_future(cancellation.clone());
     Box::pin(SseStream {
         inner: Box::pin(response.bytes_stream()),
         parser: SseParser::new(),
@@ -182,6 +239,10 @@ where
             attempts: 0,
         }),
         reconnect_future: None,
+        cancellation,
+        cancellation_future,
+        idle_timeout,
+        idle_deadline: idle_deadline(idle_timeout),
         audit,
         audit_finished: false,
         audit_status: Some(metadata.status),
@@ -201,6 +262,10 @@ struct SseStream<M> {
     seen_order: VecDeque<(String, String)>,
     reconnect: Option<ReconnectState>,
     reconnect_future: Option<ReconnectFuture>,
+    cancellation: Option<CancellationToken>,
+    cancellation_future: Option<CancellationFuture>,
+    idle_timeout: Option<Duration>,
+    idle_deadline: Option<IdleDeadline>,
     audit: Option<AuditContext>,
     audit_finished: bool,
     audit_status: Option<u16>,
@@ -221,10 +286,10 @@ where
             return;
         };
         self.audit_finished = true;
-        let outcome = if error.is_some() {
-            AuditOutcome::Failure
-        } else {
-            AuditOutcome::Success
+        let outcome = match error {
+            Some(Error::Cancelled) => AuditOutcome::Cancelled,
+            Some(_) => AuditOutcome::Failure,
+            None => AuditOutcome::Success,
         };
         audit.request_finished_with_request_id(
             outcome,
@@ -243,7 +308,7 @@ where
                     StreamEvent::ReasoningDelta { .. } => {
                         audit.first_token(FirstTokenKind::Reasoning);
                     }
-                    StreamEvent::ToolCallDelta { .. } => {
+                    StreamEvent::ToolCallDelta { .. } | StreamEvent::ToolCallProgress { .. } => {
                         audit.first_token(FirstTokenKind::ToolCall);
                     }
                     _ => {}
@@ -365,11 +430,49 @@ where
         }
         let future = reconnect.factory.connect(last_event_id);
         self.queue.push_back(Ok(StreamEvent::Retry { delay }));
+        self.queue.push_back(Ok(StreamEvent::Retrying {
+            attempt: reconnect.attempts,
+            max_attempts: reconnect.policy.max_attempts,
+            delay,
+            reason: "stream reconnect".to_string(),
+        }));
+        self.idle_deadline = None;
+        let cancellation = self.cancellation.clone();
         self.reconnect_future = Some(Box::pin(async move {
-            tokio::time::sleep(delay).await;
-            future.await
+            if let Some(cancellation) = cancellation {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Err(Error::Cancelled),
+                    _ = tokio::time::sleep(delay) => future.await,
+                }
+            } else {
+                tokio::time::sleep(delay).await;
+                future.await
+            }
         }));
         true
+    }
+
+    fn cancel(&mut self) {
+        let error = Error::Cancelled;
+        self.finish_audit(Some(&error), None);
+        self.queue.push_back(Err(error));
+        self.finished = true;
+    }
+
+    fn reset_idle_deadline(&mut self) {
+        self.idle_deadline = idle_deadline(self.idle_timeout);
+    }
+
+    fn handle_idle_timeout(&mut self) {
+        if self.schedule_reconnect(None) {
+            self.idle_deadline = None;
+            return;
+        }
+        let error = Error::Timeout("stream idle timeout".to_string());
+        self.finish_audit(Some(&error), None);
+        self.queue.push_back(Err(error));
+        self.finished = true;
     }
 
     fn handle_transport_error(&mut self, error: reqwest::Error) {
@@ -424,6 +527,32 @@ where
                 return Poll::Ready(None);
             }
 
+            if let Some(mut future) = this.cancellation_future.take() {
+                match future.as_mut().poll(cx) {
+                    Poll::Pending => {
+                        this.cancellation_future = Some(future);
+                    }
+                    Poll::Ready(()) => {
+                        this.cancel();
+                        continue;
+                    }
+                }
+            }
+
+            if this.reconnect_future.is_none()
+                && let Some(mut deadline) = this.idle_deadline.take()
+            {
+                match deadline.as_mut().poll(cx) {
+                    Poll::Pending => {
+                        this.idle_deadline = Some(deadline);
+                    }
+                    Poll::Ready(()) => {
+                        this.handle_idle_timeout();
+                        continue;
+                    }
+                }
+            }
+
             if let Some(mut future) = this.reconnect_future.take() {
                 match future.as_mut().poll(cx) {
                     Poll::Pending => {
@@ -433,6 +562,7 @@ where
                     Poll::Ready(Ok(response)) => {
                         this.inner = Box::pin(response.bytes_stream());
                         this.parser.reset_for_reconnect();
+                        this.reset_idle_deadline();
                         continue;
                     }
                     Poll::Ready(Err(error)) => {
@@ -453,6 +583,7 @@ where
                     if let Some(audit) = &this.audit {
                         audit.add_response_bytes(bytes.len());
                     }
+                    this.reset_idle_deadline();
                     let result = this.parser.push(&bytes);
                     this.process_sse_result(result);
                 }
@@ -542,6 +673,10 @@ mod tests {
             seen_order: VecDeque::new(),
             reconnect: None,
             reconnect_future: None,
+            cancellation: None,
+            cancellation_future: None,
+            idle_timeout: None,
+            idle_deadline: None,
             audit: None,
             audit_finished: false,
             audit_status: None,

@@ -8,29 +8,39 @@
 //! 3. provider adapters that only serialize the normalized form.
 //!
 //! This keeps role conversion and tool-call repair in one place.
+//!
+//! The crate intentionally stops at the model request/response boundary.
+//! Conversation loops, tool execution, permissions, and agent scheduling belong
+//! to the downstream application. See `examples/minimal_agent.rs` for a small
+//! runtime built only from the public API.
 
 mod adapter;
-mod agent;
 mod audit;
+#[cfg(feature = "blocking")]
+mod blocking;
+mod cancel;
 mod error;
 mod headers;
 mod normalize;
 mod profile;
+mod report;
 mod retry;
 mod sse;
 mod stream;
-mod tool;
+mod transform;
 mod types;
 
 pub use adapter::{
     Anthropic, AnthropicMessages, EndpointAdapter, Gemini, GeminiGenerateContent, ModelAdapter,
     OpenAI, OpenAIChat, OpenAICompatible, OpenAIResponses,
 };
-pub use agent::{Agent, AgentBuilder, AgentReply, complete_once};
 pub use audit::{
     AuditConfig, AuditEvent, AuditOutcome, AuditSink, AuditStats, AuditStatsSnapshot, ByteCounts,
     FirstTokenKind, ProfileAuditSnapshot, RequestTiming, bounded_audit_channel,
 };
+#[cfg(feature = "blocking")]
+pub use blocking::{BlockingAdapter, BlockingStream};
+pub use cancel::CancellationToken;
 pub use error::{Error, ErrorKind, ProviderErrorInfo, Result};
 pub use headers::{
     ClientInfo, HeaderInjector, HeaderPolicy, RequestContext, RequestOptions, SDK_USER_AGENT,
@@ -44,20 +54,25 @@ pub use normalize::{
 pub use profile::{
     AuthStyle, Capabilities, EffortMapping, EndpointSpec, MaxTokensSemantics, ModelMatcher,
     ModelProfile, ProfileId, ProfileRegistry, ProfileSelector, ProtocolSurface, ProviderProfile,
-    ReasoningAliases, ReasoningCapabilities, ReasoningProfile, ReasoningReplayPolicy,
-    RequestProfile, StreamCapabilities, StreamProfile, StreamTerminal, ThinkingRequestProfile,
-    ToolCallIdPolicy, ToolCapabilities, ToolProfile, UsagePlacement, UsageProfile,
+    ProviderRequestOptions, ReasoningAliases, ReasoningCapabilities, ReasoningProfile,
+    ReasoningReplayPolicy, RequestProfile, StreamCapabilities, StreamProfile, StreamTerminal,
+    ThinkingRequestProfile, ToolCallContentMode, ToolCallIdPolicy, ToolCapabilities, ToolProfile,
+    UsagePlacement, UsageProfile,
 };
+pub use report::{CompletionReport, WireAction, WireFeature, WireReport};
 pub use retry::{
     RetryDirective, RetryPolicy, RetryProvider, RetrySource, parse_retry_after,
     parse_retry_after_at, parse_retry_headers, parse_retry_headers_at, retry_async,
 };
 pub use sse::{SseError, SseEvent, SseMessage, SseParser, SseUtf8Policy};
-pub use stream::{ModelStream, StreamEvent, StreamReconnectPolicy, collect_stream, next_event};
-pub use tool::{FunctionTool, Tool, ToolRegistry, tool_fn};
+pub use stream::{
+    ModelStream, StreamError, StreamEvent, StreamReconnectPolicy, collect_stream, next_event,
+};
+pub use transform::RequestTransform;
 pub use types::{
-    ChatRequest, ChatResponse, ImageDetail, ImageUrl, Message, Part, ProviderState,
-    ProviderStateFormat, Reasoning, ReasoningConfig, ReasoningEffort, ReasoningKind, ReasoningMode,
-    ReasoningSummary, ResponseFormat, ResponseMetadata, Role, ToolCall, ToolChoice, ToolResult,
-    ToolSpec, Usage,
+    ChatRequest, ChatResponse, ImageDetail, ImagePart, ImageSource, ImageUrl, Message, Part,
+    ProviderState, ProviderStateFormat, Reasoning, ReasoningConfig, ReasoningEffort, ReasoningKind,
+    ReasoningMode, ReasoningSummary, ResponseFormat, ResponseMetadata, Role, ServerTool,
+    ServerToolItem, ServerToolState, ToolCall, ToolChoice, ToolResult, ToolResultPart, ToolSpec,
+    Usage,
 };

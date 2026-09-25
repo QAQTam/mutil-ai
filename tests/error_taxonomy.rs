@@ -158,6 +158,39 @@ fn common_http_statuses_map_to_stable_kinds() {
 }
 
 #[test]
+fn structured_provider_tokens_classify_context_and_safety_errors() {
+    let context = Error::Api {
+        provider: "test-provider",
+        status: 400,
+        body: r#"{"error":{"code":"context_length_exceeded","message":"secret"}}"#.to_string(),
+        retry_after: None,
+        retry_source: None,
+        request_id: None,
+    };
+    assert_eq!(context.kind(), ErrorKind::ContextLengthExceeded);
+    assert!(!context.is_retryable());
+
+    let safety = Error::Api {
+        provider: "test-provider",
+        status: 400,
+        body: r#"{"error":{"type":"content_filter","message":"secret"}}"#.to_string(),
+        retry_after: None,
+        retry_source: None,
+        request_id: None,
+    };
+    assert_eq!(safety.kind(), ErrorKind::ContentFiltered);
+    assert!(!safety.is_retryable());
+}
+
+#[test]
+fn cancellation_is_a_stable_non_retryable_kind() {
+    let error = Error::Cancelled;
+    assert_eq!(error.kind(), ErrorKind::Cancelled);
+    assert_eq!(error.kind().as_str(), "cancelled");
+    assert!(!error.is_retryable());
+}
+
+#[test]
 fn non_api_errors_are_classified_without_string_matching() {
     let stream = Error::StreamProtocol("bad event".to_string());
     assert_eq!(stream.kind(), ErrorKind::StreamProtocol);

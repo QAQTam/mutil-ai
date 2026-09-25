@@ -1,16 +1,21 @@
-# mutil-ai（教学版）
+# mutil-ai（provider-neutral 教学版）
 
-一个适合刚开始写 Agent 的 Rust 小 SDK。
+一个面向 Rust 初学者的 provider-neutral 模型调用 SDK。
 
 它的目标不是一次支持所有高级功能，而是先回答一个关键问题：
 
 > 内部 agent 历史可以很乱，但发到 provider 之前，如何变成干净、严格的 role 和工具配对？
 
-这个库不照搬现有 SDK 的 API 设计。它自己定义一套很小的中立消息模型，然后让每个 provider adapter 只负责：
+这个库不提供 Agent runtime。它自己定义一套很小的中立消息模型，然后让每个
+provider adapter 只负责：
 
 1. 调用归一化层；
 2. 把干净的消息序列化成 provider 的 HTTP 请求；
 3. 把 provider 响应转回中立模型。
+
+会话历史、工具执行、权限审批、取消策略和循环步数由下游项目自己决定。仓库中的
+[`examples/minimal_agent.rs`](examples/minimal_agent.rs) 展示如何只使用公开 API
+搭一个最小 Agent runtime；它不是 SDK 的公开能力。
 
 适配器仍然必须遵守各家的 HTTP 协议，因为不遵守就无法调用；但应用层不需要直接面对这些差异。
 
@@ -24,7 +29,12 @@ SDK 的长期契约、当前实现和交接清单见：
 
 供团队研判是否引入的冻结候选 API 语义见：
 
-- [`docs/api-freeze-0.1.md`](docs/api-freeze-0.1.md)
+- [`docs/api-freeze-0.2.md`](docs/api-freeze-0.2.md)
+- [`docs/api-freeze-0.1.md`](docs/api-freeze-0.1.md)（历史版本）
+
+当前版本的实现交接见：
+
+- [`docs/handoff-0.2.md`](docs/handoff-0.2.md)
 
 下游 gateway / agent 的通用扩展能力登记见：
 
@@ -88,30 +98,32 @@ AssignedToolCallId { name: "get_weather", id: "call_1" }
 SynthesizedMissingToolResult { call_id: "call_1", name: "get_weather" }
 ```
 
-## 3. 最小用法
+## 3. 最小用法：直接调用模型
 
 ```rust
-use mutil_ai::{Agent, OpenAI};
+use mutil_ai::{ChatRequest, Message, ModelAdapter, OpenAI};
 
 #[tokio::main]
 async fn main() -> mutil_ai::Result<()> {
     let model = OpenAI::responses("gpt-5.2");
 
-    let mut agent = Agent::builder()
-        .model(model)
-        .system("你是一个简洁、耐心的 Rust 老师。")
-        .build()?;
+    let request = ChatRequest::new([
+        Message::system("你是一个简洁、耐心的 Rust 老师。"),
+        Message::user("用三句话解释什么是 agent。"),
+    ]);
 
-    let answer = agent.ask("用三句话解释什么是 agent。").await?;
-    println!("{answer}");
+    let response = model.complete(&request).await?;
+    println!("{}", response.text());
 
     Ok(())
 }
 ```
 
-`OPENAI_API_KEY` 从环境变量读取。
+`OPENAI_API_KEY` 从环境变量读取。这里的 `ModelAdapter` 就是下游项目应直接调用的
+稳定边界：传入 `ChatRequest`，得到 `ChatResponse`；需要请求级 header、取消或
+transform 时改用 `complete_with`。
 
-切换 provider 不需要改 Agent 代码：
+切换 provider 不需要改业务请求代码：
 
 ```rust
 let model = OpenAI::chat("gpt-4.1");
@@ -120,47 +132,32 @@ let model = OpenAI::chat("gpt-4.1");
 // let model = mutil_ai::Gemini::generate_content("gemini-3-flash");
 ```
 
-## 4. 给 Agent 加工具
+## 4. 最小 Agent runtime：示例而非库能力
 
-```rust
-use mutil_ai::{Agent, OpenAI, tool_fn};
-use serde_json::json;
+SDK 不导出 `Agent`、`AgentBuilder`、`ToolRegistry` 或 `tool_fn`。这些类型会把
+历史存储、工具注册、权限模型和终止策略固化到库中，不适合作为通用 provider
+core 的稳定 API。
 
-let weather = tool_fn(
-    "get_weather",
-    "查询一个城市的天气",
-    json!({
-        "type": "object",
-        "properties": {
-            "city": { "type": "string" }
-        },
-        "required": ["city"]
-    }),
-    |arguments| async move {
-        let city = arguments["city"].as_str().unwrap_or("unknown");
-        Ok::<_, mutil_ai::Error>(json!({
-            "city": city,
-            "weather": "sunny"
-        }))
-    },
-);
+完整的最小 runtime 位于：
 
-let mut agent = Agent::builder()
-    .model(OpenAI::responses("gpt-5.2"))
-    .system("需要天气时调用工具。")
-    .tool(weather)
-    .max_steps(4)
-    .build()?;
+[`examples/minimal_agent.rs`](examples/minimal_agent.rs)
 
-let answer = agent.ask("广州天气怎么样？").await?;
-println!("{answer}");
-```
+它只依赖本 crate 的公开类型，并实现：
 
-完整示例见：
+1. 本地保存 `Vec<Message>` 历史；
+2. 把系统提示和 `ToolSpec` 放进 `ChatRequest`；
+3. 调用 `ModelAdapter::complete_with`；
+4. 执行本地工具并追加 `Message::tool_results`；
+5. 最多循环 `max_steps` 次。
+
+运行：
 
 ```bash
-cargo run --example tool_agent
+cargo run --example minimal_agent
 ```
+
+其他项目可以复制这个文件作为起点，再替换成自己的权限审批、取消、审计和工具
+调度实现，不需要修改或扩展 SDK 的公共 API。
 
 ## 5. 统一思考链：message 与 reasoning
 
@@ -1138,12 +1135,14 @@ src/
     openai_responses.rs OpenAI Responses
     anthropic.rs       Anthropic Messages
     gemini.rs          Gemini generateContent
-  agent.rs             适合新手的 Agent 循环
-  tool.rs              closure 风格工具
   retry.rs             Retry-After / reset header / backoff
   sse.rs               手写增量 SSE parser
   stream.rs            统一 StreamEvent 和流式事件组装
   headers.rs           UA / 请求头 / query / 注入接口
+
+examples/
+  hello.rs             直接调用 ModelAdapter 的最小示例
+  minimal_agent.rs     只使用公开 API 的 Agent runtime 示例
 ```
 
 关键点：**role 转换、工具修复和跨 provider reasoning 清洗只在 `normalize.rs`
@@ -1151,10 +1150,9 @@ src/
 
 ## 12. 当前版本刻意不做的内容
 
-这是教学版 v0.1，目前优先把 role、工具配对、retry、SSE、reasoning 和统一
-streaming 边界讲清楚，因此暂时不做：
+这是 v0.2，目前优先把 role、工具配对、retry、SSE、reasoning、统一
+streaming、取消和通用 provider 扩展边界讲清楚，因此暂时不做：
 
-- streaming 断线自动重连、`Last-Event-ID` 去重
 - WebSocket / Realtime
 - OpenAI Responses 的 `previous_response_id` / `store`
 - Anthropic `cache_control`
@@ -1162,4 +1160,5 @@ streaming 边界讲清楚，因此暂时不做：
 - embedding / rerank / speech
 - 自动把不同 provider 的 reasoning 互译；当前选择安全丢弃，而不是猜测
 
-这些以后都可以加，但应该加在明确的位置，而不是把 provider 特例塞进 Agent 主循环。
+这些以后都可以加，但应该加在明确的位置，而不是把 provider 特例塞进下游
+runtime 或示例 Agent 循环。

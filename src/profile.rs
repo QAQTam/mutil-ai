@@ -207,6 +207,7 @@ impl EndpointSpec {
 pub struct ProviderProfile {
     pub id: ProfileId,
     pub request: RequestProfile,
+    pub request_options: ProviderRequestOptions,
     pub reasoning: ReasoningProfile,
     pub tools: ToolProfile,
     pub stream: StreamProfile,
@@ -235,6 +236,7 @@ impl ProviderProfile {
         Self {
             id: id.into(),
             request: RequestProfile::default(),
+            request_options: ProviderRequestOptions::default(),
             reasoning: ReasoningProfile::default(),
             tools: ToolProfile::default(),
             stream: StreamProfile::default(),
@@ -355,6 +357,31 @@ impl ProfileRegistry {
             "openai-compatible",
         ]
     }
+}
+
+/// How an assistant tool-call message should encode empty content.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolCallContentMode {
+    /// Preserve the adapter's documented default.
+    #[default]
+    Auto,
+    Null,
+    Omit,
+    Empty,
+}
+
+/// Typed provider request switches that are common across compatible APIs.
+///
+/// `None` means "inherit the next lower-priority layer". Request-level values
+/// override provider-profile defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderRequestOptions {
+    pub tool_call_content: Option<ToolCallContentMode>,
+    pub require_provider_parameters: Option<bool>,
+    pub do_sample: Option<bool>,
+    pub include_stream_usage: Option<bool>,
+    pub prompt_cache_key: Option<String>,
+    pub user: Option<String>,
 }
 
 /// Request fields that are applied before per-call `extra_*` values.

@@ -1,12 +1,13 @@
 # mutil-ai SDK Spec / Handoff
 
-> 状态：Draft v0.13 / API freeze candidate
-> 更新时间：2026-09-24
+> 状态：Draft v0.14 / API freeze candidate
+> 更新时间：2026-09-25
 > crate：`mutil-ai`
 > lib：`mutil_ai`
-> 当前版本：`0.1.0`
+> 当前版本：`0.2.1`
 > Rust edition：2024
-> API freeze：见 [`api-freeze-0.1.md`](api-freeze-0.1.md)
+> API freeze：见 [`api-freeze-0.2.md`](api-freeze-0.2.md)
+> 实现交接：见 [`handoff-0.2.md`](handoff-0.2.md)
 
 本文同时承担两个职责：
 
@@ -19,7 +20,7 @@
 
 `mutil-ai` 是一个 provider-neutral 的 Rust 基础库：
 
-> 把不同模型厂商混乱的 role、tool、reasoning、streaming、header、error 和 retry 差异，收敛成一套稳定的中立语义；provider-specific 行为留在 profile/adapter，不进入 Agent 主循环。
+> 把不同模型厂商混乱的 role、tool、reasoning、streaming、header、error 和 retry 差异，收敛成一套稳定的中立语义；provider-specific 行为留在 profile/adapter，不进入 SDK 公共 API 或下游 runtime。
 
 它不是：
 
@@ -118,9 +119,9 @@ SDK 可以提供 registry 查找，但不能在生产热路径中靠探测猜协
 - 非 assistant reasoning 默认丢弃
 - 不在日志中默认展开 encrypted/raw state
 
-### 2.5 Agent 不知道 provider quirks
+### 2.5 SDK 不承载 Agent runtime
 
-Agent 只处理：
+SDK 的公开调用边界只有：
 
 ```rust
 ChatRequest
@@ -131,7 +132,21 @@ ToolCall
 ToolResult
 ```
 
-Agent 不处理：
+下游 runtime 负责：
+
+```text
+会话历史
+工具注册与执行
+权限审批
+循环步数
+终止条件
+Agent 调度
+```
+
+示例 [`../examples/minimal_agent.rs`](../examples/minimal_agent.rs) 展示如何只用公开
+API 实现一个最小 runtime；该示例不是库导出，也不承诺 API 稳定性。
+
+下游 runtime 不处理 provider quirks：
 
 ```text
 thinking.type
@@ -161,13 +176,19 @@ src/
     openai_responses.rs OpenAI Responses
     anthropic.rs       Anthropic Messages
     gemini.rs          Gemini generateContent
-  agent.rs             教学版 Agent 循环
-  tool.rs              closure 风格工具
   retry.rs             Retry-After / reset header / backoff
   sse.rs               手写增量 SSE parser
   stream.rs            统一 StreamEvent 和流式事件组装
   headers.rs           UA / 请求头 / query / HeaderInjector / Idempotency-Key
   profile.rs           EndpointSpec / ProviderProfile / ModelProfile 基础类型
+  cancel.rs            可克隆协作取消令牌
+  report.rs            transform / normalization / wire degradation 报告
+  transform.rs         请求 transform hook
+  blocking.rs          feature-gated 同步 wrapper
+
+examples/
+  hello.rs             直接调用 ModelAdapter 的最小示例
+  minimal_agent.rs     下游 runtime 参考实现，不属于公开库 API
 ```
 
 ### 3.2 当前已支持的协议面
@@ -208,6 +229,16 @@ src/
 - tool_choice / response_format / stop / seed 中立请求参数
 - context-free structured `AuditSink` / attempt / retry / reconnect events
 - 手写 SSE parser
+- cooperative cancellation / `ErrorKind::Cancelled`
+- retry、response body 读取与 reconnect 取消感知
+- stream idle timeout
+- 完整 usage typed fields 与 raw passthrough
+- `ToolCallProgress` / `ServerToolStatus` / `Retrying` / `Error` stream events
+- 结构化 ToolResult 与 URL/base64/file-ref 图片输入
+- OpenAI Responses server tool 声明、状态和 opaque item round-trip
+- `RequestTransform` 与 `CompletionReport`
+- typed provider request options
+- feature-gated `BlockingAdapter`
 - 本地 HTTP/SSE 集成测试
 
 ### 3.4 当前明确未完成
@@ -217,6 +248,7 @@ src/
 - 真实 provider fixture / ignored live probe
 - tracing span/context 传播与第三方 metrics exporter
 - provider probe 工具
+- fixture 生成器和更多真实 provider fixture
 
 ---
 
@@ -1179,8 +1211,8 @@ Probe 只用于开发/生成 fixture，不进入正常请求路径。
 4. `Done.response` 是流式历史的唯一权威结果。
 5. 同一个逻辑请求的 retry 必须复用同一 session 和 idempotency key。
 6. 未知 provider 字段不得自动跨协议重放。
-7. Agent 不直接处理 provider wire fields。
-8. Provider 特判不得散落在 Agent 主循环。
+7. 下游 runtime 不直接处理 provider wire fields。
+8. Provider 特判不得进入 SDK 公共 API 或下游主循环。
 9. 不支持的能力必须显式 error/drop/downgrade。
 10. 不进行隐式网络探测。
 
@@ -1223,8 +1255,9 @@ Probe 只用于开发/生成 fixture，不进入正常请求路径。
 
 ### 18.4 不应做什么
 
-- 不要给每个厂商写一个独立 Agent。
-- 不要把 reasoning alias 写进 Agent 主循环。
+- 不要给每个厂商写一个独立 provider adapter。
+- 不要把 reasoning alias 写进 SDK 或下游 runtime 主循环。
+- 不要把 Agent loop、工具执行或权限策略重新加回库公共 API。
 - 不要根据 base URL 自动猜协议。
 - 不要把所有 reasoning 都强制转成普通 text。
 - 不要在没有 fixture 的情况下“兼容”新 provider。
@@ -1236,7 +1269,7 @@ Probe 只用于开发/生成 fixture，不进入正常请求路径。
 
 一个“基本完成”的 SDK 应满足：
 
-1. 切换 provider 不需要改 Agent 循环。
+1. 切换 provider 不需要改下游 runtime 或请求构造代码。
 2. non-stream 和 stream 使用同一中立语义。
 3. reasoning/tool/usage/error 都有稳定出口。
 4. 未知 provider 必须显式配置 profile。
@@ -1264,4 +1297,4 @@ Probe 只用于开发/生成 fixture，不进入正常请求路径。
 + lenient ingress
 ```
 
-只要守住这条边界，provider 再多、字段再乱，也不会把复杂度泄漏给下游 Agent。
+只要守住这条边界，provider 再多、字段再乱，也不会把复杂度泄漏给下游 runtime。

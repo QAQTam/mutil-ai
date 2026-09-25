@@ -1,5 +1,9 @@
+use std::fmt;
+
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
+
+use crate::report::CompletionReport;
 
 /// The role used inside your application.
 ///
@@ -30,8 +34,12 @@ pub enum Part {
     ImageUrl {
         image_url: ImageUrl,
     },
+    Image {
+        image: ImagePart,
+    },
     ToolCall(ToolCall),
     ToolResult(ToolResult),
+    ProviderItem(ServerToolItem),
 }
 
 impl Part {
@@ -65,6 +73,10 @@ impl Part {
             },
         }
     }
+
+    pub fn image(image: ImagePart) -> Self {
+        Self::Image { image }
+    }
 }
 
 /// The main display category of a reasoning item.
@@ -97,10 +109,23 @@ pub enum ProviderStateFormat {
 /// The `data` value must be passed back to the same provider unchanged. It can
 /// contain a signature, encrypted content, an item id, or other fields whose
 /// meaning is deliberately unknown to the SDK.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderState {
     pub format: ProviderStateFormat,
     pub data: serde_json::Value,
+}
+
+impl fmt::Debug for ProviderState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let bytes = serde_json::to_vec(&self.data)
+            .map(|data| data.len())
+            .unwrap_or_default();
+        formatter
+            .debug_struct("ProviderState")
+            .field("format", &self.format)
+            .field("data_bytes", &bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProviderState {
@@ -185,6 +210,110 @@ pub enum ImageDetail {
     High,
 }
 
+/// A provider-hosted tool declaration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerTool {
+    WebSearch,
+    UrlContext,
+    FileSearch,
+    Custom {
+        name: String,
+        config: serde_json::Value,
+    },
+}
+
+/// Generic state of a provider-hosted tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerToolState {
+    InProgress,
+    Completed,
+    Failed,
+    Unknown,
+}
+
+/// Opaque provider-hosted tool item returned by a provider.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServerToolItem {
+    pub tool: Option<String>,
+    pub call_id: Option<String>,
+    pub state: Option<ServerToolState>,
+    /// Provider-owned item. It must be replayed unchanged to the same provider.
+    pub provider_state: ProviderState,
+}
+
+impl ServerToolItem {
+    pub fn new(provider_state: ProviderState) -> Self {
+        Self {
+            tool: None,
+            call_id: None,
+            state: None,
+            provider_state,
+        }
+    }
+}
+
+/// A provider-neutral image source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ImageSource {
+    Url {
+        url: String,
+    },
+    Base64 {
+        media_type: String,
+        data: String,
+    },
+    FileRef {
+        uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_type: Option<String>,
+    },
+}
+
+/// A multimodal image input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImagePart {
+    pub source: ImageSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ImageDetail>,
+}
+
+impl ImagePart {
+    pub fn url(url: impl Into<String>) -> Self {
+        Self {
+            source: ImageSource::Url { url: url.into() },
+            detail: None,
+        }
+    }
+
+    pub fn base64(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            source: ImageSource::Base64 {
+                media_type: media_type.into(),
+                data: data.into(),
+            },
+            detail: None,
+        }
+    }
+
+    pub fn file_ref(uri: impl Into<String>, media_type: Option<String>) -> Self {
+        Self {
+            source: ImageSource::FileRef {
+                uri: uri.into(),
+                media_type,
+            },
+            detail: None,
+        }
+    }
+
+    pub fn detail(mut self, detail: ImageDetail) -> Self {
+        self.detail = Some(detail);
+        self
+    }
+}
+
 /// A tool call requested by the model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -226,13 +355,29 @@ impl ToolCall {
     }
 }
 
+/// A structured tool-result payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolResultPart {
+    Text { text: String },
+    Json { value: serde_json::Value },
+    Image { image: ImagePart },
+}
+
 /// A tool result that will be sent back to the model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub call_id: Option<String>,
     pub name: String,
+    /// Plain-text fallback retained for simple tools and provider downgrade.
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<ToolResultPart>,
     pub is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 impl ToolResult {
@@ -241,11 +386,21 @@ impl ToolResult {
         name: impl Into<String>,
         content: impl Into<String>,
     ) -> Self {
+        let content = content.into();
         Self {
             call_id,
             name: name.into(),
-            content: content.into(),
+            parts: if content.is_empty() {
+                Vec::new()
+            } else {
+                vec![ToolResultPart::Text {
+                    text: content.clone(),
+                }]
+            },
+            content,
             is_error: false,
+            status: None,
+            metadata: None,
         }
     }
 
@@ -254,12 +409,75 @@ impl ToolResult {
         name: impl Into<String>,
         content: impl Into<String>,
     ) -> Self {
+        let mut result = Self::new(call_id, name, content);
+        result.is_error = true;
+        result
+    }
+
+    pub fn from_parts(
+        call_id: Option<String>,
+        name: impl Into<String>,
+        parts: Vec<ToolResultPart>,
+    ) -> Self {
         Self {
             call_id,
             name: name.into(),
-            content: content.into(),
-            is_error: true,
+            content: tool_result_parts_text(&parts),
+            parts,
+            is_error: false,
+            status: None,
+            metadata: None,
         }
+    }
+
+    pub fn json(
+        call_id: Option<String>,
+        name: impl Into<String>,
+        value: serde_json::Value,
+    ) -> Self {
+        Self::from_parts(call_id, name, vec![ToolResultPart::Json { value }])
+    }
+
+    pub fn image(call_id: Option<String>, name: impl Into<String>, image: ImagePart) -> Self {
+        Self::from_parts(call_id, name, vec![ToolResultPart::Image { image }])
+    }
+
+    pub fn status(mut self, status: impl Into<String>) -> Self {
+        self.status = Some(status.into());
+        self
+    }
+
+    pub fn metadata(mut self, metadata: serde_json::Value) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+}
+
+fn tool_result_parts_text(parts: &[ToolResultPart]) -> String {
+    let mut output = String::new();
+    for part in parts {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        match part {
+            ToolResultPart::Text { text } => output.push_str(text),
+            ToolResultPart::Json { value } => {
+                output
+                    .push_str(&serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()));
+            }
+            ToolResultPart::Image { image } => {
+                output.push_str(&format!("[image: {}]", image_source_label(&image.source)));
+            }
+        }
+    }
+    output
+}
+
+fn image_source_label(source: &ImageSource) -> String {
+    match source {
+        ImageSource::Url { url } => url.clone(),
+        ImageSource::Base64 { media_type, .. } => format!("base64:{media_type}"),
+        ImageSource::FileRef { uri, .. } => uri.clone(),
     }
 }
 
@@ -528,6 +746,8 @@ pub enum ResponseFormat {
 pub struct ChatRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_tools: Vec<ServerTool>,
     pub tool_choice: Option<ToolChoice>,
     pub response_format: Option<ResponseFormat>,
     pub stop: Vec<String>,
@@ -558,6 +778,11 @@ impl ChatRequest {
 
     pub fn tools(mut self, tools: impl IntoIterator<Item = ToolSpec>) -> Self {
         self.tools = tools.into_iter().collect();
+        self
+    }
+
+    pub fn server_tools(mut self, tools: impl IntoIterator<Item = ServerTool>) -> Self {
+        self.server_tools = tools.into_iter().collect();
         self
     }
 
@@ -619,6 +844,20 @@ impl ChatRequest {
 pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    /// Provider-native usage object for fields not yet given a neutral name.
+    pub raw: Option<serde_json::Value>,
+}
+
+impl Usage {
+    /// Remove provider-native data before exposing usage to audit sinks.
+    pub(crate) fn without_raw(mut self) -> Self {
+        self.raw = None;
+        self
+    }
 }
 
 /// HTTP metadata associated with a model response.
@@ -630,6 +869,16 @@ pub struct ResponseMetadata {
 }
 
 impl ResponseMetadata {
+    pub fn header(&self, name: impl AsRef<str>) -> Option<&reqwest::header::HeaderValue> {
+        reqwest::header::HeaderName::from_bytes(name.as_ref().as_bytes())
+            .ok()
+            .and_then(|name| self.headers.get(name))
+    }
+
+    pub fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
     pub fn from_response(response: &reqwest::Response) -> Self {
         let request_id = ["x-request-id", "request-id", "x-ms-request-id", "cf-ray"]
             .into_iter()
@@ -654,9 +903,15 @@ impl ResponseMetadata {
 pub struct ChatResponse {
     pub message: Message,
     pub usage: Option<Usage>,
+    /// Provider-native response or accumulated stream chunks.
+    ///
+    /// Shape is protocol-specific and can be large. Do not log it by default.
     pub raw: serde_json::Value,
     #[serde(skip)]
     pub metadata: Option<ResponseMetadata>,
+    /// Transformations applied while preparing or decoding this response.
+    #[serde(skip)]
+    pub report: CompletionReport,
 }
 
 impl ChatResponse {
@@ -666,6 +921,7 @@ impl ChatResponse {
             usage: None,
             raw: serde_json::Value::Null,
             metadata: None,
+            report: CompletionReport::default(),
         }
     }
 

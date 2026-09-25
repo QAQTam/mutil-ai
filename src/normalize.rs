@@ -149,6 +149,10 @@ pub enum NormalizeAction {
         format: ProviderStateFormat,
         expected: ProviderStateFormat,
     },
+    DroppedForeignProviderItem {
+        format: ProviderStateFormat,
+        expected: ProviderStateFormat,
+    },
     DroppedReasoningFromNonAssistant {
         role: ExternalRole,
     },
@@ -202,6 +206,9 @@ impl NormalizeReport {
                 NormalizeAction::DroppedForeignTextState { .. } => {
                     stats.dropped_foreign_text_state += 1;
                 }
+                NormalizeAction::DroppedForeignProviderItem { .. } => {
+                    stats.dropped_foreign_provider_item += 1;
+                }
                 NormalizeAction::DroppedReasoningFromNonAssistant { .. } => {
                     stats.dropped_reasoning_from_non_assistant += 1;
                 }
@@ -213,7 +220,7 @@ impl NormalizeReport {
 }
 
 /// Context-free aggregate of normalization repairs.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NormalizeStats {
     pub total: u32,
     pub downgraded_developer: u32,
@@ -226,6 +233,7 @@ pub struct NormalizeStats {
     pub dropped_foreign_reasoning: u32,
     pub dropped_foreign_tool_state: u32,
     pub dropped_foreign_text_state: u32,
+    pub dropped_foreign_provider_item: u32,
     pub dropped_reasoning_from_non_assistant: u32,
     pub merged_adjacent: u32,
 }
@@ -388,7 +396,7 @@ impl Normalizer {
                         provider_state,
                     });
                 }
-                Part::ImageUrl { .. } => parts.push(part.clone()),
+                Part::ImageUrl { .. } | Part::Image { .. } => parts.push(part.clone()),
                 Part::Reasoning(reasoning) => {
                     if !self.options.preserve_foreign_reasoning
                         && let Some(state) = &reasoning.state
@@ -442,6 +450,20 @@ impl Normalizer {
                 Part::ToolResult(result) => {
                     // A result inside an assistant message is malformed.
                     self.handle_orphan_tool_result(result)?;
+                }
+                Part::ProviderItem(item) => {
+                    if self.options.preserve_foreign_reasoning
+                        || item.provider_state.format == self.expected_reasoning_format
+                    {
+                        parts.push(part.clone());
+                    } else {
+                        self.report
+                            .actions
+                            .push(NormalizeAction::DroppedForeignProviderItem {
+                                format: item.provider_state.format.clone(),
+                                expected: self.expected_reasoning_format.clone(),
+                            });
+                    }
                 }
             }
         }
@@ -656,7 +678,7 @@ fn normalize_non_tool_parts(parts: &[Part]) -> Vec<Part> {
         .iter()
         .filter_map(|part| match part {
             Part::Text { text, .. } => Some(Part::text(text)),
-            Part::ImageUrl { .. } => Some(part.clone()),
+            Part::ImageUrl { .. } | Part::Image { .. } => Some(part.clone()),
             Part::Reasoning(_) => None,
             Part::ToolCall(call) => Some(Part::text(format!(
                 "Unpaired tool call `{}` with arguments {}",
@@ -666,6 +688,7 @@ fn normalize_non_tool_parts(parts: &[Part]) -> Vec<Part> {
                 "Orphan tool result from `{}`: {}",
                 result.name, result.content
             ))),
+            Part::ProviderItem(_) => None,
         })
         .collect()
 }

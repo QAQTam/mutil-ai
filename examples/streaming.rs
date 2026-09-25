@@ -30,11 +30,36 @@ async fn main() -> mutil_ai::Result<()> {
                     name.as_deref().unwrap_or("...")
                 );
             }
+            StreamEvent::ToolCallProgress {
+                index,
+                name,
+                arguments_so_far,
+                ..
+            } => {
+                println!(
+                    "[tool {index}] {} accumulated {arguments_so_far}",
+                    name.as_deref().unwrap_or("...")
+                );
+            }
+            StreamEvent::ServerToolStatus { tool, state, .. } => {
+                println!("[server tool {tool}] {state:?}");
+            }
             StreamEvent::Usage { usage } => {
                 println!("usage: {usage:?}");
             }
             StreamEvent::Retry { delay } => {
                 println!("server requested retry after {delay:?}");
+            }
+            StreamEvent::Retrying {
+                attempt,
+                max_attempts,
+                delay,
+                reason,
+            } => {
+                println!("retry {attempt}/{max_attempts} after {delay:?}: {reason}");
+            }
+            StreamEvent::Error { error } => {
+                eprintln!("stream error {:?}: {}", error.kind, error.message);
             }
             StreamEvent::Done { response, .. } => {
                 println!("\n\nfinal message: {}", response.text());

@@ -11,8 +11,11 @@ use reqwest::header::{
 };
 
 use crate::audit::{AuditConfig, AuditContext, AuditRequestMeta, AuditSink, ProfileAuditSnapshot};
+use crate::cancel::CancellationToken;
 use crate::error::{Error, Result};
+use crate::profile::ProviderRequestOptions;
 use crate::stream::StreamReconnectPolicy;
+use crate::transform::RequestTransform;
 
 pub const SDK_USER_AGENT: &str = concat!("mutil-ai/", env!("CARGO_PKG_VERSION"));
 
@@ -95,13 +98,15 @@ impl RequestContext {
 }
 
 /// Per-request transport options.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct RequestOptions {
     pub headers: HeaderMap,
     pub user_agent: Option<HeaderValue>,
     pub context: RequestContext,
     pub idempotency_key: Option<String>,
     pub timeout: Option<Duration>,
+    /// Maximum time between bytes while reading an SSE stream.
+    pub idle_timeout: Option<Duration>,
     /// Additional query parameters appended to the endpoint URL.
     ///
     /// Duplicate names are preserved. Protocol-reserved names are validated by
@@ -109,8 +114,38 @@ pub struct RequestOptions {
     pub extra_query: Vec<(String, String)>,
     /// Opt-in reconnect policy for a stream after it has started.
     pub stream_reconnect: Option<StreamReconnectPolicy>,
+    /// Cooperative cancellation shared by all attempts and stream reads.
+    pub cancellation: Option<CancellationToken>,
+    /// Optional transform applied once before capability gating and
+    /// normalization.
+    pub request_transform: Option<Arc<dyn RequestTransform>>,
+    /// Typed provider request switches for this logical request.
+    pub provider_request: ProviderRequestOptions,
     /// Per-request override for transport audit switches.
     pub audit_config: Option<AuditConfig>,
+}
+
+impl fmt::Debug for RequestOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestOptions")
+            .field("headers", &self.headers)
+            .field("user_agent", &self.user_agent)
+            .field("context", &self.context)
+            .field("idempotency_key", &self.idempotency_key)
+            .field("timeout", &self.timeout)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("extra_query", &self.extra_query)
+            .field("stream_reconnect", &self.stream_reconnect)
+            .field("cancellation", &self.cancellation)
+            .field(
+                "request_transform",
+                &self.request_transform.as_ref().map(|_| "<configured>"),
+            )
+            .field("provider_request", &self.provider_request)
+            .field("audit_config", &self.audit_config)
+            .finish()
+    }
 }
 
 impl RequestOptions {
@@ -147,6 +182,25 @@ impl RequestOptions {
         self
     }
 
+    pub fn cancellation(mut self, token: CancellationToken) -> Self {
+        self.cancellation = Some(token);
+        self
+    }
+
+    pub fn cancellation_token(self, token: CancellationToken) -> Self {
+        self.cancellation(token)
+    }
+
+    pub fn request_transform(mut self, transform: impl RequestTransform + 'static) -> Self {
+        self.request_transform = Some(Arc::new(transform));
+        self
+    }
+
+    pub fn provider_request(mut self, provider_request: ProviderRequestOptions) -> Self {
+        self.provider_request = provider_request;
+        self
+    }
+
     pub fn audit_config(mut self, audit_config: AuditConfig) -> Self {
         self.audit_config = Some(audit_config);
         self
@@ -171,6 +225,11 @@ impl RequestOptions {
 
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = Some(idle_timeout);
         self
     }
 

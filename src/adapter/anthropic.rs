@@ -5,13 +5,16 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 use super::{
-    ModelAdapter, ReconnectRequest, ReconnectRequestParts, effective_retry_policy,
+    ModelAdapter, ReconnectRequest, ReconnectRequestParts, apply_provider_request_options,
+    apply_request_transform, audit_outcome_for_error, completion_report, effective_retry_policy,
     finish_sse_stream, json_body_bytes, merge_extra_body, prepare_headers, protocol_name,
-    resolve_api_key, send_json_retry, send_stream_retry, validate_tool_choice,
+    resolve_api_key, send_json_retry, send_stream_retry, validate_server_tools,
+    validate_tool_choice,
 };
 use crate::error::{Error, Result};
 use crate::headers::{RequestOptions, TransportConfig};
 use crate::normalize::{ExternalRole, NormalizedChat, Protocol, normalize};
+use crate::report::CompletionReport;
 use crate::retry::{RetryPolicy, RetryProvider};
 use crate::sse::SseMessage;
 use crate::stream::{ModelStream, SseMapper, StreamEvent};
@@ -92,10 +95,19 @@ impl ModelAdapter for AnthropicMessages {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ChatResponse> {
+        let transformed = apply_request_transform(request, options)?;
+        let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
+        let request = transformed.as_ref();
         let (normalized, report) = normalize(request, Protocol::AnthropicMessages)?;
         validate_anthropic_request(request)?;
         let mut body = to_anthropic_body(&self.model, &normalized, request);
         merge_extra_body(&mut body, request, Protocol::AnthropicMessages, None)?;
+        apply_provider_request_options(
+            &mut body,
+            Protocol::AnthropicMessages,
+            &options.provider_request,
+            false,
+        )?;
         let request_body_bytes = json_body_bytes(&body)?;
         let key = resolve_api_key(
             self.provider_name(),
@@ -114,6 +126,9 @@ impl ModelAdapter for AnthropicMessages {
         );
         if let Some(audit) = &audit {
             audit.request_started();
+            if transform_applied {
+                audit.transform_applied();
+            }
             audit.normalization(report.stats());
         }
 
@@ -132,6 +147,7 @@ impl ModelAdapter for AnthropicMessages {
             RetryProvider::Anthropic,
             &retry_policy,
             audit.as_ref(),
+            options.cancellation.as_ref(),
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -153,7 +169,7 @@ impl ModelAdapter for AnthropicMessages {
             Err(error) => {
                 if let Some(audit) = &audit {
                     audit.request_finished_with_request_id(
-                        crate::audit::AuditOutcome::Failure,
+                        audit_outcome_for_error(&error),
                         error.status(),
                         error.request_id().map(str::to_string),
                         Some(&error),
@@ -179,6 +195,12 @@ impl ModelAdapter for AnthropicMessages {
                 return Err(error);
             }
         };
+        response.report = completion_report(
+            Protocol::AnthropicMessages,
+            request,
+            report.stats(),
+            transform_applied,
+        );
         if let Some(audit) = &audit {
             audit.request_finished_with_request_id(
                 crate::audit::AuditOutcome::Success,
@@ -197,11 +219,20 @@ impl ModelAdapter for AnthropicMessages {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ModelStream> {
+        let transformed = apply_request_transform(request, options)?;
+        let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
+        let request = transformed.as_ref();
         let (normalized, report) = normalize(request, Protocol::AnthropicMessages)?;
         validate_anthropic_request(request)?;
         let mut body = to_anthropic_body(&self.model, &normalized, request);
         merge_extra_body(&mut body, request, Protocol::AnthropicMessages, None)?;
         body["stream"] = json!(true);
+        apply_provider_request_options(
+            &mut body,
+            Protocol::AnthropicMessages,
+            &options.provider_request,
+            true,
+        )?;
         let request_body_bytes = json_body_bytes(&body)?;
 
         let key = resolve_api_key(
@@ -221,6 +252,9 @@ impl ModelAdapter for AnthropicMessages {
         );
         if let Some(audit) = &audit {
             audit.request_started();
+            if transform_applied {
+                audit.transform_applied();
+            }
             audit.normalization(report.stats());
         }
 
@@ -240,6 +274,7 @@ impl ModelAdapter for AnthropicMessages {
             RetryProvider::Anthropic,
             &retry_policy,
             audit.as_ref(),
+            options.cancellation.as_ref(),
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -260,7 +295,7 @@ impl ModelAdapter for AnthropicMessages {
             Err(error) => {
                 if let Some(audit) = &audit {
                     audit.request_finished_with_request_id(
-                        crate::audit::AuditOutcome::Failure,
+                        audit_outcome_for_error(&error),
                         error.status(),
                         error.request_id().map(str::to_string),
                         Some(&error),
@@ -272,7 +307,14 @@ impl ModelAdapter for AnthropicMessages {
         };
 
         let metadata = ResponseMetadata::from_response(&response);
-        let mapper = AnthropicStreamMapper::new(self.model.clone(), metadata);
+        let mapper = AnthropicStreamMapper::new(self.model.clone(), metadata).with_report(
+            completion_report(
+                Protocol::AnthropicMessages,
+                request,
+                report.stats(),
+                transform_applied,
+            ),
+        );
         let reconnect = options.stream_reconnect.map(|_| {
             ReconnectRequest::new(ReconnectRequestParts {
                 provider: self.provider_name(),
@@ -293,6 +335,8 @@ impl ModelAdapter for AnthropicMessages {
             mapper,
             options.stream_reconnect,
             reconnect,
+            options.cancellation.clone(),
+            options.idle_timeout,
             audit,
         ))
     }
@@ -352,7 +396,7 @@ pub(crate) fn to_anthropic_body(
                         Part::ToolResult(result) => Some(json!({
                             "type": "tool_result",
                             "tool_use_id": result.call_id.clone().unwrap_or_else(|| result.name.clone()),
-                            "content": result.content,
+                            "content": anthropic_tool_result_content(result),
                             "is_error": result.is_error,
                         })),
                         _ => None,
@@ -404,6 +448,7 @@ pub(crate) fn to_anthropic_body(
 }
 
 pub(crate) fn validate_anthropic_request(request: &ChatRequest) -> Result<()> {
+    validate_server_tools(Protocol::AnthropicMessages, request)?;
     validate_tool_choice(&request.tools, request.tool_choice.as_ref())?;
     if request.response_format.is_some() {
         return Err(Error::Unsupported(
@@ -456,9 +501,59 @@ fn anthropic_content(parts: &[Part]) -> Vec<Value> {
                     "url": image_url.url,
                 }
             })),
+            Part::Image { image } => Some(anthropic_image_block(&image.source)),
             _ => None,
         })
         .collect()
+}
+
+fn anthropic_tool_result_content(result: &crate::types::ToolResult) -> Value {
+    if result
+        .parts
+        .iter()
+        .all(|part| matches!(part, crate::types::ToolResultPart::Text { .. }))
+    {
+        return Value::String(result.content.clone());
+    }
+
+    Value::Array(
+        result
+            .parts
+            .iter()
+            .map(|part| match part {
+                crate::types::ToolResultPart::Text { text } => {
+                    json!({"type": "text", "text": text})
+                }
+                crate::types::ToolResultPart::Json { value } => {
+                    json!({"type": "text", "text": value.to_string()})
+                }
+                crate::types::ToolResultPart::Image { image } => {
+                    anthropic_image_block(&image.source)
+                }
+            })
+            .collect(),
+    )
+}
+
+fn anthropic_image_block(source: &crate::types::ImageSource) -> Value {
+    match source {
+        crate::types::ImageSource::Url { url } => json!({
+            "type": "image",
+            "source": {"type": "url", "url": url},
+        }),
+        crate::types::ImageSource::Base64 { media_type, data } => json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": data,
+            },
+        }),
+        crate::types::ImageSource::FileRef { uri, .. } => json!({
+            "type": "image",
+            "source": {"type": "url", "url": uri},
+        }),
+    }
 }
 
 fn anthropic_thinking(config: Option<&ReasoningConfig>) -> Option<Value> {
@@ -517,6 +612,7 @@ pub(crate) struct AnthropicStreamMapper {
     usage: Option<Usage>,
     finish_reason: Option<String>,
     chunks: Vec<Value>,
+    report: CompletionReport,
 }
 
 impl AnthropicStreamMapper {
@@ -530,7 +626,13 @@ impl AnthropicStreamMapper {
             usage: None,
             finish_reason: None,
             chunks: Vec::new(),
+            report: CompletionReport::default(),
         }
+    }
+
+    pub(crate) fn with_report(mut self, report: CompletionReport) -> Self {
+        self.report = report;
+        self
     }
 
     fn push_start(&mut self, events: &mut Vec<StreamEvent>) {
@@ -622,6 +724,7 @@ impl AnthropicStreamMapper {
             usage: self.usage.clone(),
             raw: Value::Array(self.chunks.clone()),
             metadata: Some(self.metadata.clone()),
+            report: self.report.clone(),
         };
         events.push(StreamEvent::Done {
             response: Box::new(response),
@@ -757,11 +860,25 @@ impl SseMapper for AnthropicStreamMapper {
                             {
                                 input_json.push_str(partial_json);
                             }
+                            let (id, name, arguments_so_far) = match self.block_mut(index) {
+                                Some(AnthropicBlockAccumulator::ToolUse {
+                                    id,
+                                    name,
+                                    input_json,
+                                }) => (Some(id.clone()), Some(name.clone()), input_json.clone()),
+                                _ => (None, None, String::new()),
+                            };
                             events.push(StreamEvent::ToolCallDelta {
                                 index,
                                 id: None,
                                 name: None,
                                 arguments_delta: partial_json.to_string(),
+                            });
+                            events.push(StreamEvent::ToolCallProgress {
+                                index,
+                                id,
+                                name,
+                                arguments_so_far,
                             });
                         }
                     }
@@ -799,6 +916,12 @@ impl SseMapper for AnthropicStreamMapper {
     }
 }
 
+fn anthropic_usage(value: &Value) -> Usage {
+    let mut usage = None;
+    anthropic_merge_usage(&mut usage, value);
+    usage.unwrap_or_default()
+}
+
 fn anthropic_merge_usage(current: &mut Option<Usage>, value: &Value) {
     let usage = current.get_or_insert_with(Usage::default);
     if let Some(input_tokens) = value.get("input_tokens").and_then(Value::as_u64) {
@@ -806,6 +929,32 @@ fn anthropic_merge_usage(current: &mut Option<Usage>, value: &Value) {
     }
     if let Some(output_tokens) = value.get("output_tokens").and_then(Value::as_u64) {
         usage.output_tokens = Some(output_tokens);
+    }
+    if let Some(total_tokens) = value.get("total_tokens").and_then(Value::as_u64) {
+        usage.total_tokens = Some(total_tokens);
+    }
+    if let Some(cache_read_tokens) = value.get("cache_read_input_tokens").and_then(Value::as_u64) {
+        usage.cache_read_tokens = Some(cache_read_tokens);
+    }
+    if let Some(cache_write_tokens) = value
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+    {
+        usage.cache_write_tokens = Some(cache_write_tokens);
+    }
+    if let Some(reasoning_tokens) = value.get("reasoning_tokens").and_then(Value::as_u64) {
+        usage.reasoning_tokens = Some(reasoning_tokens);
+    }
+    usage.raw = Some(merge_usage_raw(usage.raw.take(), value));
+}
+
+fn merge_usage_raw(current: Option<Value>, next: &Value) -> Value {
+    match (current, next) {
+        (Some(Value::Object(mut current)), Value::Object(next)) => {
+            current.extend(next.clone());
+            Value::Object(current)
+        }
+        (_, next) => next.clone(),
     }
 }
 
@@ -874,16 +1023,14 @@ pub(crate) fn from_anthropic_response(value: Value) -> Result<ChatResponse> {
         }
     }
 
-    let usage = value.get("usage").map(|usage| Usage {
-        input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
-        output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
-    });
+    let usage = value.get("usage").map(anthropic_usage);
 
     Ok(ChatResponse {
         message: Message::new(Role::Assistant, parts),
         usage,
         raw: value,
         metadata: None,
+        report: CompletionReport::default(),
     })
 }
 
