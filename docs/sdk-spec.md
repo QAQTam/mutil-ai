@@ -1202,6 +1202,8 @@ Probe 只用于开发/生成 fixture，不进入正常请求路径。
 - [x] ReasoningAliases / ThinkingRequest / ReasoningReplayPolicy 驱动 Chat profile
 - [x] ToolCallIdPolicy 类型（尚未驱动 normalize）
 - [x] typed ErrorKind / status / provider / request id
+- [x] NormalizeProfile / SystemPlacement：原位 system / developer 注入（默认仍 MergeIntoTop）
+- [x] ErrorKind 三层分类：provider token → 文案 marker（受 status 门控）→ HTTP status
 - [ ] provider probe
 - [ ] domestic provider fixtures
 

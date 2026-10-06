@@ -1,6 +1,6 @@
 [package]
 name = "mutil-ai"
-version = "0.3.0"
+version = "0.3.2"
 edition = "2024"
 description = "A beginner-friendly, provider-neutral Rust AI SDK with a strict normalization layer."
 license = "MIT"
