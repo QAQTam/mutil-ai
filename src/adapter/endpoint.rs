@@ -25,7 +25,7 @@ use super::{
 use crate::audit::{AuditContext, ProfileAuditSnapshot};
 use crate::error::{Error, Result};
 use crate::headers::{RequestOptions, TransportConfig};
-use crate::normalize::{NormalizeReport, Protocol, normalize};
+use crate::normalize::{NormalizeReport, Protocol};
 use crate::profile::{
     AuthStyle, Capabilities, EndpointSpec, ModelProfile, ReasoningAliases, ReasoningReplayPolicy,
 };
@@ -417,7 +417,8 @@ impl EndpointAdapter {
     ) -> Result<(serde_json::Value, NormalizeReport)> {
         let profile = self.provider_profile.as_ref();
         let model_profile = self.selected_model_profile();
-        let (normalized, report) = normalize(request, self.endpoint.protocol)?;
+        let (normalized, report) =
+            super::normalize_for_protocol(request, self.endpoint.protocol, profile)?;
 
         let (mut body, report) = match self.endpoint.protocol {
             Protocol::OpenAiChat => {

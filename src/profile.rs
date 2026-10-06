@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 ///
 /// See [`crate::normalize::Protocol`] for the available values.
 pub use crate::normalize::Protocol as ProtocolSurface;
+use crate::normalize::SystemPlacement;
 
 /// Stable identifier for a provider profile.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -224,6 +225,17 @@ impl EndpointSpec {
     }
 }
 
+/// Normalization behavior attached to a provider profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NormalizeProfile {
+    /// How system/developer messages are placed.
+    ///
+    /// `FirstToTopRestInPlace` is honored only by the OpenAI Chat Completions
+    /// and OpenAI Responses adapters; Anthropic and Gemini always merge
+    /// system text into the top-level entry.
+    pub system_placement: SystemPlacement,
+}
+
 /// Provider-level defaults and behavior switches.
 #[derive(Debug, Clone)]
 pub struct ProviderProfile {
@@ -233,6 +245,8 @@ pub struct ProviderProfile {
     pub request: RequestProfile,
     /// Typed request switches shared across OpenAI-compatible APIs.
     pub request_options: ProviderRequestOptions,
+    /// Normalization behavior for requests sent to this provider.
+    pub normalize: NormalizeProfile,
     /// Reasoning field names, replay policy, and thinking request controls.
     pub reasoning: ReasoningProfile,
     /// Tool-call encoding and ID handling behavior.
@@ -273,6 +287,7 @@ impl ProviderProfile {
             id: id.into(),
             request: RequestProfile::default(),
             request_options: ProviderRequestOptions::default(),
+            normalize: NormalizeProfile::default(),
             reasoning: ReasoningProfile::default(),
             tools: ToolProfile::default(),
             stream: StreamProfile::default(),

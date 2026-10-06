@@ -940,3 +940,27 @@ where
 
     unreachable!("the loop returns on success or on the final error")
 }
+
+/// Normalize a request with protocol defaults plus profile overrides.
+///
+/// System placement is an OpenAI-protocol capability: Anthropic and Gemini
+/// keep merged top-level system behavior regardless of the profile.
+pub(crate) fn normalize_for_protocol(
+    request: &crate::types::ChatRequest,
+    protocol: crate::normalize::Protocol,
+    profile: Option<&crate::profile::ProviderProfile>,
+) -> crate::error::Result<(
+    crate::normalize::NormalizedChat,
+    crate::normalize::NormalizeReport,
+)> {
+    let mut options = crate::normalize::NormalizeOptions::for_protocol(protocol);
+    if let Some(profile) = profile
+        && matches!(
+            protocol,
+            crate::normalize::Protocol::OpenAiChat | crate::normalize::Protocol::OpenAiResponses
+        )
+    {
+        options.system_placement = profile.normalize.system_placement;
+    }
+    crate::normalize::normalize_with_options(request, options)
+}

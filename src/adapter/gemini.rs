@@ -349,7 +349,9 @@ pub(crate) fn to_gemini_body(normalized: &NormalizedChat, request: &ChatRequest)
 
     for message in &normalized.messages {
         match message.role {
-            ExternalRole::System => {
+            ExternalRole::System | ExternalRole::Developer => {
+                // Gemini always merges system text (see `SystemPlacement`);
+                // an in-place developer message is demoted to a user turn.
                 push_gemini_content(
                     &mut contents,
                     "user",

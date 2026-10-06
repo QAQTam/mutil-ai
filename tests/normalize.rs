@@ -143,6 +143,7 @@ fn explicit_policy_can_drop_unpaired_tool_calls() {
         missing_tool_result: MissingToolResultPolicy::DropToolCall,
         merge_adjacent_same_role: false,
         preserve_foreign_reasoning: false,
+        system_placement: mutil_ai::SystemPlacement::MergeIntoTop,
     };
 
     let (clean, report) = normalize_with_options(&request, options).unwrap();
@@ -273,4 +274,46 @@ fn custom_role_is_kept_out_of_the_wire_role_set() {
     let (clean, _) = normalize(&request, Protocol::GeminiGenerateContent).unwrap();
 
     assert_eq!(clean.messages[0].role, ExternalRole::User);
+}
+
+#[test]
+fn system_placement_first_to_top_rest_in_place_keeps_later_injections() {
+    use mutil_ai::{
+        ChatRequest, ExternalRole, Message, NormalizeOptions, Part, Protocol, Role,
+        SystemPlacement, normalize_with_options,
+    };
+    let request = ChatRequest::new(vec![
+        Message::system("base prompt"),
+        Message::user("hi"),
+        Message::new(Role::Developer, vec![Part::text("skill body")]),
+        Message::system("late catalog"),
+    ]);
+    let options = NormalizeOptions {
+        system_placement: SystemPlacement::FirstToTopRestInPlace,
+        ..NormalizeOptions::for_protocol(Protocol::OpenAiResponses)
+    };
+    let (normalized, _report) = normalize_with_options(&request, options).expect("normalize");
+    assert_eq!(normalized.system.as_deref(), Some("base prompt"));
+    let roles: Vec<ExternalRole> = normalized.messages.iter().map(|m| m.role.clone()).collect();
+    assert_eq!(
+        roles,
+        vec![ExternalRole::User, ExternalRole::Developer, ExternalRole::System]
+    );
+}
+
+#[test]
+fn system_placement_default_merges_everything_to_top() {
+    use mutil_ai::{
+        ChatRequest, Message, NormalizeOptions, Protocol, normalize_with_options,
+    };
+    let request = ChatRequest::new(vec![
+        Message::system("base"),
+        Message::user("hi"),
+        Message::system("catalog"),
+    ]);
+    let options = NormalizeOptions::for_protocol(Protocol::OpenAiChat);
+    let (normalized, _report) = normalize_with_options(&request, options).expect("normalize");
+    assert_eq!(normalized.system.as_deref(), Some("base\n\ncatalog"));
+    let roles: Vec<_> = normalized.messages.iter().map(|m| m.role.clone()).collect();
+    assert_eq!(roles, vec![mutil_ai::ExternalRole::User]);
 }
