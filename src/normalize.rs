@@ -33,7 +33,9 @@ pub enum ExternalRole {
     System,
     /// Instruction message kept at its position in the history.
     ///
-    /// Produced only under [`SystemPlacement::FirstToTopRestInPlace`].
+    /// Produced only under [`SystemPlacement::FirstToTopRestInPlace`] on the
+    /// OpenAI protocols. Strict OpenAI-compatible endpoints that reject a
+    /// `developer` role should keep [`SystemPlacement::MergeIntoTop`].
     Developer,
     User,
     Assistant,
@@ -367,9 +369,10 @@ pub fn normalize(
 
 /// Normalize a request with explicit rules.
 ///
-/// The output is intentionally boring: only `System`, `User`, `Assistant` and
-/// `Tool` can reach an adapter, and every `ToolCall` is paired with a
-/// `ToolResult`.
+/// The output is intentionally boring: only `System`, `Developer`, `User`,
+/// `Assistant` and `Tool` can reach an adapter, and every `ToolCall` is
+/// paired with a `ToolResult`. `Developer` appears only under
+/// [`SystemPlacement::FirstToTopRestInPlace`] on the OpenAI protocols.
 ///
 /// # Errors
 ///

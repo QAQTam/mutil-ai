@@ -274,18 +274,23 @@ pub enum Role {
 ```rust
 pub enum ExternalRole {
     System,
+    Developer,
     User,
     Assistant,
     Tool,
 }
 ```
 
-默认降级：
+默认降级（`SystemPlacement::MergeIntoTop`）：
 
 ```text
 Developer -> System
 Custom(_) -> User
 ```
+
+`SystemPlacement::FirstToTopRestInPlace`（仅 OpenAI Chat/Responses 生效）：
+首条 System 提顶，其余 System/Developer 原位保留；Anthropic/Gemini 忽略该
+策略并维持上述降级表。
 
 ### 4.2 Part
 
@@ -352,8 +357,11 @@ pub struct ProviderState {
 
 ### 5.1 Role
 
-- System 提取为 system instructions
-- Developer 默认降级为 System
+- SystemPlacement::MergeIntoTop（默认）：System 全部提取为 system
+  instructions，Developer 降级为 System
+- SystemPlacement::FirstToTopRestInPlace：首条 System 提顶，其后
+  System/Developer 原位保留（`ExternalRole::System` /
+  `ExternalRole::Developer`）
 - Custom 默认降级为 User
 - Anthropic/Gemini 合并相邻同 role 消息
 

@@ -765,6 +765,39 @@ impl ModelAdapter for EndpointAdapter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn system_placement_policy_is_ignored_outside_openai_protocols() {
+        use crate::normalize::{ExternalRole, Protocol, SystemPlacement};
+        use crate::types::{ChatRequest, Message, Part, Role};
+        let mut profile = ProviderProfile::new("gating");
+        profile.normalize.system_placement = SystemPlacement::FirstToTopRestInPlace;
+        let request = ChatRequest::new(vec![
+            Message::system("base"),
+            Message::user("hi"),
+            Message::system("late catalog"),
+            Message::new(Role::Developer, vec![Part::text("skill body")]),
+        ]);
+        for protocol in [Protocol::AnthropicMessages, Protocol::GeminiGenerateContent] {
+            let (normalized, _report) =
+                super::super::normalize_for_protocol(&request, protocol, Some(&profile))
+                    .expect("normalize");
+            let system = normalized.system.expect("merged system text");
+            assert!(
+                system.contains("base")
+                    && system.contains("late catalog")
+                    && system.contains("skill body"),
+                "{protocol:?} must merge everything to top"
+            );
+            assert!(
+                !normalized.messages.iter().any(|m| matches!(
+                    m.role,
+                    ExternalRole::System | ExternalRole::Developer
+                )),
+                "{protocol:?} must not receive in-place instruction messages"
+            );
+        }
+    }
+
     use super::*;
     use crate::profile::{Capabilities, ModelMatcher, ProfileSelector, ProviderProfile};
     use crate::types::{Message, Role, ToolSpec};
