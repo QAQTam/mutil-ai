@@ -1008,10 +1008,13 @@ pub enum ErrorKind {
     PermissionDenied,
     NotFound,
     InvalidRequest,
+    ContextLengthExceeded,
+    ContentFiltered,
     RateLimited,
     Overloaded,
     Timeout,
     Connection,
+    Cancelled,
     Decode,
     StreamProtocol,
     ProviderInternal,
@@ -1058,6 +1061,19 @@ status 和 body 字节数。`provider_error()` 对常见 OpenAI、Anthropic、Ge
 500..=599           ProviderInternal
 ```
 
+`kind()` 按三层信号依次尝试，命中即返回：
+
+1. provider 机器可读 token：`code` / `type` / `status`，读取顶层、`error`
+   与 Responses 的 `response.error`；
+2. message 文案 marker：仅当 status 落在 `InvalidRequest` 带内，或错误来自
+   stream 带内 payload（`Error::ProviderStream`，没有 HTTP status 可用）；
+3. HTTP status 缺省映射。
+
+第 2 层只读承载文案的字段（`message` / `error_message` / `error_msg` /
+`error_description` / `reason`，非 JSON body 取全文）并在 8 KiB 处截断；body 中
+被回显的请求内容不参与分类，429/5xx 与鉴权失败也不会被文案改写类别。这样
+context-length 与 content-filter 在只给文案、不给错误码的兼容网关上仍能识别。
+
 retryable 默认包括：
 
 ```text
@@ -1081,9 +1097,6 @@ ProviderInternal
 
 仍待补充：
 
-- provider body 的结构化错误码解析；
-- content-filter 与 context-length 的更精确识别；
-- cancellation；
 - request id 进入非 API 错误链。
 
 ---

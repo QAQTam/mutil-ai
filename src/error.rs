@@ -357,7 +357,7 @@ impl Error {
             Self::Timeout(_) => ErrorKind::Timeout,
             Self::Json(_) => ErrorKind::Decode,
             Self::StreamProtocol(_) => ErrorKind::StreamProtocol,
-            Self::ProviderStream(_) => ErrorKind::ProviderInternal,
+            Self::ProviderStream(value) => classify_provider_stream(value),
             Self::Api { status, body, .. } => classify_api_error(*status, body),
             Self::MissingModel(_) => ErrorKind::Configuration,
             Self::InvalidRequest(_) => ErrorKind::InvalidRequest,
@@ -528,29 +528,176 @@ fn provider_token(value: &serde_json::Value) -> Option<String> {
     Some(token.to_string())
 }
 
+/// How much of a provider message is scanned before classification gives up.
+const MESSAGE_SCAN_LIMIT: usize = 8 * 1024;
+
+/// Message phrases that report a context-window rejection, collected across the
+/// public error shapes of mainstream chat APIs. Deliberately narrow: each
+/// phrase names the window or the token budget, so an unrelated malformed
+/// request cannot be mistaken for an overflow.
+const CONTEXT_LENGTH_MARKERS: &[&str] = &[
+    "context_length_exceeded",
+    "context length",
+    "context window",
+    "context limit",
+    "context too long",
+    "prompt is too long",
+    "too many tokens",
+    "reduce the length",
+    "input length",
+];
+
+/// Message phrases that report a safety or content-policy rejection.
+const CONTENT_FILTER_MARKERS: &[&str] = &[
+    "content_filter",
+    "content filter",
+    "content policy",
+    "content safety",
+    "safety policy",
+    "policy violation",
+    "filtered due to",
+];
+
 fn classify_api_error(status: u16, body: &str) -> ErrorKind {
-    let info = parse_provider_error(body);
-    let tokens = [
-        info.code.as_deref(),
-        info.error_type.as_deref(),
-        info.status.as_deref(),
-    ];
-    for token in tokens.into_iter().flatten() {
-        match token.to_ascii_lowercase().as_str() {
-            "context_length_exceeded"
-            | "context_length_exceeded_error"
-            | "context_too_long"
-            | "prompt_too_long"
-            | "max_tokens_exceeded" => return ErrorKind::ContextLengthExceeded,
-            "content_filter"
-            | "content_filtered"
-            | "content_policy_violation"
-            | "safety"
-            | "safety_blocked" => return ErrorKind::ContentFiltered,
-            _ => {}
-        }
+    if let Some(kind) = classify_error_tokens(body) {
+        return kind;
+    }
+    // Only the generic invalid-request band is refined from message text: a
+    // rate limit or a 5xx keeps its own kind whatever the body says.
+    if matches!(classify_status(status), ErrorKind::InvalidRequest)
+        && let Some(kind) = classify_error_message(body)
+    {
+        return kind;
     }
     classify_status(status)
+}
+
+/// Classify an in-band provider stream error payload, which carries no HTTP
+/// status to gate on. Falls back to the previous blanket
+/// [`ErrorKind::ProviderInternal`] when the payload says nothing more.
+fn classify_provider_stream(payload: &str) -> ErrorKind {
+    classify_error_tokens(payload)
+        .or_else(|| classify_error_message(payload))
+        .unwrap_or(ErrorKind::ProviderInternal)
+}
+
+fn classify_error_tokens(payload: &str) -> Option<ErrorKind> {
+    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    error_tokens(&value)
+        .iter()
+        .find_map(|token| classify_token(token))
+}
+
+fn classify_error_message(payload: &str) -> Option<ErrorKind> {
+    let text = provider_message_text(payload)?;
+    let lower = text.to_ascii_lowercase();
+    if CONTEXT_LENGTH_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return Some(ErrorKind::ContextLengthExceeded);
+    }
+    if CONTENT_FILTER_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return Some(ErrorKind::ContentFiltered);
+    }
+    None
+}
+
+fn classify_token(token: &str) -> Option<ErrorKind> {
+    match token.to_ascii_lowercase().as_str() {
+        "context_length_exceeded"
+        | "context_length_exceeded_error"
+        | "context_too_long"
+        | "prompt_too_long"
+        | "max_tokens_exceeded" => Some(ErrorKind::ContextLengthExceeded),
+        "content_filter"
+        | "content_filtered"
+        | "content_policy_violation"
+        | "safety"
+        | "safety_blocked" => Some(ErrorKind::ContentFiltered),
+        _ => None,
+    }
+}
+
+/// Machine-readable tokens from the error containers providers use: the top
+/// level, an `error` member, and the Responses `response.error` member.
+fn error_tokens(value: &serde_json::Value) -> Vec<String> {
+    const FIELDS: [&str; 3] = ["code", "type", "status"];
+    let mut tokens = Vec::new();
+    for node in error_nodes(value) {
+        for field in FIELDS {
+            if let Some(token) = node.get(field).and_then(provider_token) {
+                tokens.push(token);
+            }
+        }
+    }
+    tokens
+}
+
+/// Error-bearing objects in one payload, outermost first.
+fn error_nodes(value: &serde_json::Value) -> Vec<&serde_json::Value> {
+    let mut nodes = Vec::new();
+    if value.is_object() || value.is_string() {
+        nodes.push(value);
+    }
+    for path in [
+        ["error"].as_slice(),
+        ["error", "error"].as_slice(),
+        ["response", "error"].as_slice(),
+    ] {
+        let mut node = value;
+        for key in path {
+            node = match node.get(key) {
+                Some(next) => next,
+                None => break,
+            };
+        }
+        if (node.is_object() || node.is_string()) && !nodes.contains(&node) {
+            nodes.push(node);
+        }
+    }
+    nodes
+}
+
+/// The human-readable part of an error payload, capped so a large plain-text
+/// body cannot make classification expensive.
+///
+/// Only message-bearing fields are read; request content echoed under other
+/// keys cannot influence the classification. A body that is not JSON at all
+/// (a gateway error page or plain-text 400) is scanned as-is.
+fn provider_message_text(payload: &str) -> Option<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return Some(scan_prefix(payload));
+    };
+    for node in error_nodes(&value) {
+        if let Some(text) = node.as_str() {
+            return Some(scan_prefix(text));
+        }
+        for field in [
+            "message",
+            "error_message",
+            "error_msg",
+            "error_description",
+            "reason",
+        ] {
+            if let Some(text) = node.get(field).and_then(serde_json::Value::as_str) {
+                return Some(scan_prefix(text));
+            }
+        }
+    }
+    None
+}
+
+/// First [`MESSAGE_SCAN_LIMIT`] bytes of `text`, truncated to a char boundary.
+fn scan_prefix(text: &str) -> String {
+    let mut end = text.len().min(MESSAGE_SCAN_LIMIT);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 fn classify_status(status: u16) -> ErrorKind {
