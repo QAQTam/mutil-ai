@@ -453,6 +453,9 @@ pub(crate) fn to_openai_chat_body_with_profile(
             crate::normalize::ExternalRole::System => {
                 messages.push(json!({"role": "system", "content": text_content(message)}));
             }
+            crate::normalize::ExternalRole::Developer => {
+                messages.push(json!({"role": "developer", "content": text_content(message)}));
+            }
             crate::normalize::ExternalRole::User => {
                 messages.push(json!({
                     "role": "user",
@@ -1463,6 +1466,35 @@ fn content_value(parts: &[Part]) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn in_place_system_and_developer_keep_history_positions() {
+        use crate::normalize::{Protocol, SystemPlacement};
+        let mut profile = crate::profile::ProviderProfile::new("test-chat");
+        profile.normalize.system_placement = SystemPlacement::FirstToTopRestInPlace;
+        let request = crate::types::ChatRequest::new(vec![
+            crate::types::Message::system("base"),
+            crate::types::Message::user("hi"),
+            crate::types::Message::new(
+                crate::types::Role::Developer,
+                vec![crate::types::Part::text("skill body")],
+            ),
+        ]);
+        let (normalized, _report) = super::super::normalize_for_protocol(
+            &request,
+            Protocol::OpenAiChat,
+            Some(&profile),
+        )
+        .expect("normalize");
+        let body = to_openai_chat_body_with_profile("m", &normalized, &request, Some(&profile), None)
+            .expect("body");
+        let msgs = body["messages"].as_array().expect("messages");
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "base");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[2]["role"], "developer");
+        assert_eq!(msgs[2]["content"], "skill body");
+    }
+
     use super::*;
     use crate::normalize::{Protocol, normalize};
 

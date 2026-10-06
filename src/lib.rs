@@ -48,12 +48,13 @@ pub use headers::{
 };
 pub use normalize::{
     ExternalRole, MissingToolResultPolicy, NormalizeAction, NormalizeOptions, NormalizeReport,
-    NormalizeStats, NormalizedChat, NormalizedMessage, OrphanToolResultPolicy, Protocol, normalize,
-    normalize_with_options,
+    NormalizeStats, NormalizedChat, NormalizedMessage, OrphanToolResultPolicy, Protocol,
+    SystemPlacement, normalize, normalize_with_options,
 };
 pub use profile::{
     AuthStyle, Capabilities, EffortMapping, EndpointSpec, MaxTokensSemantics, ModelMatcher,
-    ModelProfile, ProfileId, ProfileRegistry, ProfileSelector, ProtocolSurface, ProviderProfile,
+    ModelProfile, NormalizeProfile, ProfileId, ProfileRegistry, ProfileSelector, ProtocolSurface,
+    ProviderProfile,
     ProviderRequestOptions, ReasoningAliases, ReasoningCapabilities, ReasoningProfile,
     ReasoningReplayPolicy, RequestProfile, StreamCapabilities, StreamProfile, StreamTerminal,
     ThinkingRequestProfile, ToolCallContentMode, ToolCallIdPolicy, ToolCapabilities, ToolProfile,

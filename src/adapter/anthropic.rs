@@ -359,7 +359,9 @@ pub(crate) fn to_anthropic_body(
 
     for message in &normalized.messages {
         match message.role {
-            ExternalRole::System => {
+            ExternalRole::System | ExternalRole::Developer => {
+                // Anthropic always merges system text (see `SystemPlacement`);
+                // an in-place developer message is demoted to a user turn.
                 push_anthropic_message(
                     &mut messages,
                     "user",

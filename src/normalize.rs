@@ -31,6 +31,10 @@ impl Protocol {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalRole {
     System,
+    /// Instruction message kept at its position in the history.
+    ///
+    /// Produced only under [`SystemPlacement::FirstToTopRestInPlace`].
+    Developer,
     User,
     Assistant,
     Tool,
@@ -58,6 +62,22 @@ pub enum MissingToolResultPolicy {
     Error,
 }
 
+/// How `System`/`Developer` messages are placed by normalization.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SystemPlacement {
+    /// Merge every system/developer message into the top-level system text
+    /// (rendered as a leading system entry or `instructions`).
+    #[default]
+    MergeIntoTop,
+    /// The first `System` message becomes the top-level system text; later
+    /// `System` and `Developer` messages stay at their position in the
+    /// history, preserving prefix-cache-friendly runtime injections for
+    /// endpoints that accept instruction messages inline (OpenAI Chat
+    /// Completions and OpenAI Responses). Other protocols ignore the policy
+    /// and keep [`Self::MergeIntoTop`] semantics.
+    FirstToTopRestInPlace,
+}
+
 /// Rules used by the normalization layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizeOptions {
@@ -77,6 +97,8 @@ pub struct NormalizeOptions {
     /// Anthropic and Gemini require user/model turns to alternate. OpenAI does
     /// not require this, so its adapter keeps the original message boundaries.
     pub merge_adjacent_same_role: bool,
+    /// How system/developer messages are placed; see [`SystemPlacement`].
+    pub system_placement: SystemPlacement,
     /// Keep reasoning state produced by a different provider protocol.
     ///
     /// This is disabled by default because signatures and encrypted reasoning
@@ -104,6 +126,7 @@ impl NormalizeOptions {
             missing_tool_result: MissingToolResultPolicy::Synthesize,
             merge_adjacent_same_role,
             preserve_foreign_reasoning: false,
+            system_placement: SystemPlacement::MergeIntoTop,
         }
     }
 }
@@ -366,6 +389,7 @@ pub fn normalize_with_options(
         pending_calls: Vec::new(),
         next_call_id: 1,
         expected_reasoning_format,
+        top_taken: false,
     };
 
     for message in &request.messages {
@@ -392,16 +416,32 @@ struct Normalizer {
     pending_calls: Vec<PendingCall>,
     next_call_id: u64,
     expected_reasoning_format: ProviderStateFormat,
+    /// True once a system message has claimed the top-level slot under
+    /// `SystemPlacement::FirstToTopRestInPlace`.
+    top_taken: bool,
 }
 
 impl Normalizer {
     fn push(&mut self, message: &Message) -> Result<()> {
         match &message.role {
             Role::System => {
+                if self.options.system_placement == SystemPlacement::FirstToTopRestInPlace
+                    && self.top_taken
+                {
+                    self.place_in_place(message, ExternalRole::System);
+                    return Ok(());
+                }
+                if self.options.system_placement == SystemPlacement::FirstToTopRestInPlace {
+                    self.top_taken = true;
+                }
                 self.push_system(message);
                 Ok(())
             }
             Role::Developer => {
+                if self.options.system_placement == SystemPlacement::FirstToTopRestInPlace {
+                    self.place_in_place(message, ExternalRole::Developer);
+                    return Ok(());
+                }
                 self.report
                     .actions
                     .push(NormalizeAction::DowngradedDeveloper);
@@ -441,6 +481,14 @@ impl Normalizer {
         let text = text_parts_joined(&message.parts);
         if !text.is_empty() {
             self.system.push(text);
+        }
+    }
+
+    fn place_in_place(&mut self, message: &Message, role: ExternalRole) {
+        self.report_non_assistant_reasoning(role.clone(), &message.parts);
+        let parts = normalize_non_tool_parts(&message.parts);
+        if !parts.is_empty() {
+            self.messages.push(NormalizedMessage { role, parts });
         }
     }
 
