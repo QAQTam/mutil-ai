@@ -272,6 +272,32 @@ fn message_text_classifies_content_filtering() {
 }
 
 #[test]
+fn top_level_error_code_token_classifies_without_message_help() {
+    // `error_code` at the top level is the field name several compatible APIs
+    // use; it must keep classifying after the container walk was rewritten.
+    let overflow = api_error_body(
+        400,
+        r#"{"error_code":"context_length_exceeded","error_message":"request rejected"}"#,
+    );
+    assert_eq!(overflow.kind(), ErrorKind::ContextLengthExceeded);
+
+    let filtered = api_error_body(
+        400,
+        r#"{"error_code":"content_filter","error_message":"request rejected"}"#,
+    );
+    assert_eq!(filtered.kind(), ErrorKind::ContentFiltered);
+}
+
+#[test]
+fn context_wording_wins_when_both_conditions_are_described() {
+    let error = api_error_body(
+        400,
+        r#"{"error":{"message":"prompt is too long, and the answer was filtered due to a content policy"}}"#,
+    );
+    assert_eq!(error.kind(), ErrorKind::ContextLengthExceeded);
+}
+
+#[test]
 fn message_text_never_rewrites_a_specific_status() {
     let rate_limited = api_error_body(
         429,
@@ -307,9 +333,8 @@ fn provider_stream_errors_classify_in_band_payloads() {
     );
     assert_eq!(prose.kind(), ErrorKind::ContextLengthExceeded);
 
-    let opaque = Error::ProviderStream(
-        r#"{"error":{"type":"server_error","message":"boom"}}"#.to_string(),
-    );
+    let opaque =
+        Error::ProviderStream(r#"{"error":{"type":"server_error","message":"boom"}}"#.to_string());
     assert_eq!(opaque.kind(), ErrorKind::ProviderInternal);
     assert!(opaque.is_retryable());
 }

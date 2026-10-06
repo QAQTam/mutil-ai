@@ -1063,16 +1063,25 @@ status 和 body 字节数。`provider_error()` 对常见 OpenAI、Anthropic、Ge
 
 `kind()` 按三层信号依次尝试，命中即返回：
 
-1. provider 机器可读 token：`code` / `type` / `status`，读取顶层、`error`
-   与 Responses 的 `response.error`；
+1. provider 机器可读 token：`code` / `error_code` / `type` / `status`，读取顶层、
+   `error` 与 Responses 的 `response.error`；
 2. message 文案 marker：仅当 status 落在 `InvalidRequest` 带内，或错误来自
    stream 带内 payload（`Error::ProviderStream`，没有 HTTP status 可用）；
 3. HTTP status 缺省映射。
 
+只有第 2 层受 status 门控。第 1 层不看 status（既有语义，不是本次引入）：
+provider 自己给了标签就一定采纳——例如 429 + `{"error":{"code":"safety"}}`
+仍归 `ContentFiltered`。消费方不要按"status 决定一切"做假设。
+
 第 2 层只读承载文案的字段（`message` / `error_message` / `error_msg` /
 `error_description` / `reason`，非 JSON body 取全文）并在 8 KiB 处截断；body 中
-被回显的请求内容不参与分类，429/5xx 与鉴权失败也不会被文案改写类别。这样
-context-length 与 content-filter 在只给文案、不给错误码的兼容网关上仍能识别。
+被回显的请求内容不参与分类，429/5xx 与鉴权失败也不会被文案改写类别。两类
+marker 同时命中时取 context（"收缩请求"是更可执行的解读）。这样 context-length
+与 content-filter 在只给文案、不给错误码的兼容网关上仍能识别。
+
+分类读取的容器集（顶层 / `error` / `response.error`）比公开的 `provider_error()`
+摘要更广——后者按脱敏契约仍只读顶层与 `error`。所以 Responses 形态的带内
+payload 可能分类得出来而 `provider_error()` 返回 `None`；统一两者留待后续。
 
 retryable 默认包括：
 
