@@ -678,8 +678,7 @@ impl ResponsesStreamMapper {
             // on `response.completed` still streamed their items through
             // `output_item.done`; backfill them from the accumulator so the
             // terminal response is never empty.
-            normalized.message =
-                Message::new(Role::Assistant, self.accumulated_parts());
+            normalized.message = Message::new(Role::Assistant, self.accumulated_parts());
         }
         normalized.metadata = Some(self.metadata.clone());
         normalized.report = self.report.clone();
@@ -1605,6 +1604,9 @@ mod tests {
         let call = response.tool_calls().next().expect("backfilled tool call");
         assert_eq!(call.name, "lookup");
         assert_eq!(call.arguments, json!({"q": "Rust"}));
-        assert!(response.raw.is_object(), "real terminal keeps the response object");
+        assert!(
+            response.raw.is_object(),
+            "real terminal keeps the response object"
+        );
     }
 }

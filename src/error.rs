@@ -559,13 +559,16 @@ const CONTENT_FILTER_MARKERS: &[&str] = &[
 ];
 
 fn classify_api_error(status: u16, body: &str) -> ErrorKind {
-    if let Some(kind) = classify_error_tokens(body) {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    // The token layer is not status-gated (unchanged from before): a provider
+    // that labels its failure always gets that label honoured.
+    if let Some(kind) = classify_error_tokens(parsed.as_ref()) {
         return kind;
     }
     // Only the generic invalid-request band is refined from message text: a
     // rate limit or a 5xx keeps its own kind whatever the body says.
     if matches!(classify_status(status), ErrorKind::InvalidRequest)
-        && let Some(kind) = classify_error_message(body)
+        && let Some(kind) = classify_error_message(parsed.as_ref(), body)
     {
         return kind;
     }
@@ -576,21 +579,30 @@ fn classify_api_error(status: u16, body: &str) -> ErrorKind {
 /// status to gate on. Falls back to the previous blanket
 /// [`ErrorKind::ProviderInternal`] when the payload says nothing more.
 fn classify_provider_stream(payload: &str) -> ErrorKind {
-    classify_error_tokens(payload)
-        .or_else(|| classify_error_message(payload))
+    let parsed = serde_json::from_str::<serde_json::Value>(payload).ok();
+    classify_error_tokens(parsed.as_ref())
+        .or_else(|| classify_error_message(parsed.as_ref(), payload))
         .unwrap_or(ErrorKind::ProviderInternal)
 }
 
-fn classify_error_tokens(payload: &str) -> Option<ErrorKind> {
-    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
-    error_tokens(&value)
+fn classify_error_tokens(parsed: Option<&serde_json::Value>) -> Option<ErrorKind> {
+    let value = parsed?;
+    error_tokens(value)
         .iter()
         .find_map(|token| classify_token(token))
 }
 
-fn classify_error_message(payload: &str) -> Option<ErrorKind> {
-    let text = provider_message_text(payload)?;
+/// Refine a kind from the provider's own wording. `parsed` is the payload once
+/// it has been read as JSON; a body that is not JSON at all (a gateway error
+/// page, a plain-text 400) is scanned as-is.
+fn classify_error_message(parsed: Option<&serde_json::Value>, payload: &str) -> Option<ErrorKind> {
+    let text = match parsed {
+        Some(value) => provider_message_text(value)?,
+        None => scan_prefix(payload),
+    };
     let lower = text.to_ascii_lowercase();
+    // Context first: a rejection can quote both conditions, and shrinking the
+    // request is the actionable reading.
     if CONTEXT_LENGTH_MARKERS
         .iter()
         .any(|marker| lower.contains(marker))
@@ -624,8 +636,11 @@ fn classify_token(token: &str) -> Option<ErrorKind> {
 
 /// Machine-readable tokens from the error containers providers use: the top
 /// level, an `error` member, and the Responses `response.error` member.
+///
+/// `error_code` is read alongside `code` because that is the field name several
+/// compatible APIs use at the top level of an error body.
 fn error_tokens(value: &serde_json::Value) -> Vec<String> {
-    const FIELDS: [&str; 3] = ["code", "type", "status"];
+    const FIELDS: [&str; 4] = ["code", "error_code", "type", "status"];
     let mut tokens = Vec::new();
     for node in error_nodes(value) {
         for field in FIELDS {
@@ -662,17 +677,13 @@ fn error_nodes(value: &serde_json::Value) -> Vec<&serde_json::Value> {
     nodes
 }
 
-/// The human-readable part of an error payload, capped so a large plain-text
-/// body cannot make classification expensive.
+/// The human-readable part of an error payload, capped so a large body cannot
+/// make classification expensive.
 ///
 /// Only message-bearing fields are read; request content echoed under other
-/// keys cannot influence the classification. A body that is not JSON at all
-/// (a gateway error page or plain-text 400) is scanned as-is.
-fn provider_message_text(payload: &str) -> Option<String> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
-        return Some(scan_prefix(payload));
-    };
-    for node in error_nodes(&value) {
+/// keys cannot influence the classification.
+fn provider_message_text(value: &serde_json::Value) -> Option<String> {
+    for node in error_nodes(value) {
         if let Some(text) = node.as_str() {
             return Some(scan_prefix(text));
         }
