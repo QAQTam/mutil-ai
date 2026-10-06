@@ -207,3 +207,109 @@ fn non_api_errors_are_classified_without_string_matching() {
     assert_eq!(decode.kind(), ErrorKind::Decode);
     assert!(!decode.is_retryable());
 }
+
+fn api_error_body(status: u16, body: &str) -> Error {
+    Error::Api {
+        provider: "test-provider",
+        status,
+        body: body.to_string(),
+        retry_after: None,
+        retry_source: None,
+        request_id: None,
+    }
+}
+
+#[test]
+fn message_text_classifies_context_overflow_without_provider_codes() {
+    let cases = [
+        (
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"This model's maximum context length is 8192 tokens, however you requested 21000 tokens."}}"#,
+        ),
+        (
+            400,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#,
+        ),
+        (
+            413,
+            r#"{"error":{"message":"Request exceeds the model context window."}}"#,
+        ),
+        (400, "Range of input length should be [1, 128000]"),
+        (
+            400,
+            r#"{"error":{"message":"input length and `max_tokens` exceed context limit"}}"#,
+        ),
+    ];
+
+    for (status, body) in cases {
+        assert_eq!(
+            api_error_body(status, body).kind(),
+            ErrorKind::ContextLengthExceeded,
+            "status={status} body={body}"
+        );
+        assert!(
+            !api_error_body(status, body).is_retryable(),
+            "overflow is a request-shape rejection: status={status} body={body}"
+        );
+    }
+}
+
+#[test]
+fn message_text_classifies_content_filtering() {
+    let cases = [
+        r#"{"error":{"type":"invalid_request_error","message":"The response was filtered due to the prompt triggering a content management policy."}}"#,
+        r#"{"error":{"message":"The prompt was rejected by the content safety policy."}}"#,
+        r#"{"message":"The input was blocked by the content safety policy."}"#,
+    ];
+
+    for body in cases {
+        assert_eq!(
+            api_error_body(400, body).kind(),
+            ErrorKind::ContentFiltered,
+            "body={body}"
+        );
+    }
+}
+
+#[test]
+fn message_text_never_rewrites_a_specific_status() {
+    let rate_limited = api_error_body(
+        429,
+        r#"{"error":{"message":"too many tokens per minute, reduce the length of your bursts"}}"#,
+    );
+    assert_eq!(rate_limited.kind(), ErrorKind::RateLimited);
+
+    let overloaded = api_error_body(503, "prompt is too long for the primary replica");
+    assert_eq!(overloaded.kind(), ErrorKind::ProviderInternal);
+}
+
+#[test]
+fn echoed_request_content_cannot_change_the_kind() {
+    // Only message-bearing fields are scanned; request content echoed under an
+    // unrelated key must not classify as an overflow.
+    let error = api_error_body(
+        400,
+        r#"{"error":{"type":"invalid_request_error","message":"value is not one of the allowed enum values","param":"tools[0].function"},"echoed_input":"please discuss the context window design"}"#,
+    );
+    assert_eq!(error.kind(), ErrorKind::InvalidRequest);
+}
+
+#[test]
+fn provider_stream_errors_classify_in_band_payloads() {
+    let coded = Error::ProviderStream(
+        r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"context_length_exceeded","message":"hidden"}}}"#
+            .to_string(),
+    );
+    assert_eq!(coded.kind(), ErrorKind::ContextLengthExceeded);
+
+    let prose = Error::ProviderStream(
+        r#"{"error":{"message":"This model's maximum context length is 4096 tokens"}}"#.to_string(),
+    );
+    assert_eq!(prose.kind(), ErrorKind::ContextLengthExceeded);
+
+    let opaque = Error::ProviderStream(
+        r#"{"error":{"type":"server_error","message":"boom"}}"#.to_string(),
+    );
+    assert_eq!(opaque.kind(), ErrorKind::ProviderInternal);
+    assert!(opaque.is_retryable());
+}
