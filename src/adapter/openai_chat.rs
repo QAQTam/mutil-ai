@@ -29,6 +29,12 @@ use crate::types::{
 };
 
 /// Entry point for OpenAI-compatible adapters.
+///
+/// [`OpenAI`] is a namespace for constructing adapters that speak OpenAI's
+/// wire protocols: use [`OpenAI::chat`] for the Chat Completions API and
+/// [`OpenAI::responses`] for the Responses API. Both adapters default to
+/// `https://api.openai.com/v1` and fall back to the `OPENAI_API_KEY`
+/// environment variable when no API key is set explicitly.
 pub struct OpenAI;
 
 impl OpenAI {
@@ -44,6 +50,18 @@ impl OpenAI {
 }
 
 /// Adapter for `POST /v1/chat/completions`.
+///
+/// [`OpenAIChat`] speaks OpenAI's Chat Completions protocol: neutral
+/// [`ChatRequest`]s are normalized and mapped onto the
+/// `/v1/chat/completions` body, and responses (including reasoning content
+/// and tool calls) are mapped back to a neutral [`ChatResponse`]. Together
+/// with [`OpenAIChat::base_url`], it also serves as the base protocol for
+/// third-party OpenAI-compatible endpoints.
+///
+/// Streaming uses server-sent events and requests usage reporting via
+/// `stream_options.include_usage`. Requests are authorized with
+/// `Authorization: Bearer <key>`, where the key comes from
+/// [`OpenAIChat::api_key`] or the `OPENAI_API_KEY` environment variable.
 pub struct OpenAIChat {
     model: String,
     api_key: Option<String>,
@@ -54,6 +72,8 @@ pub struct OpenAIChat {
 }
 
 impl OpenAIChat {
+    /// Creates a Chat Completions adapter for `model`, defaulting to
+    /// OpenAI's public endpoint.
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
@@ -65,21 +85,30 @@ impl OpenAIChat {
         }
     }
 
+    /// Sets the API key sent as `Authorization: Bearer <key>`.
+    ///
+    /// When unset, the `OPENAI_API_KEY` environment variable is used.
     pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
         self
     }
 
+    /// Overrides the API base URL (default `https://api.openai.com/v1`).
+    ///
+    /// The `/chat/completions` path is appended, so this can point at any
+    /// OpenAI-compatible endpoint.
     pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
 
+    /// Overrides the retry policy applied to transient transport failures.
     pub fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
         self
     }
 
+    /// Sets the transport configuration used when preparing outgoing requests.
     pub fn transport(mut self, transport: TransportConfig) -> Self {
         self.transport = transport;
         self
@@ -379,6 +408,13 @@ impl OpenAiChatWireProfile {
     }
 }
 
+/// Builds the OpenAI Chat Completions request body from a normalized request,
+/// without model-specific overrides.
+///
+/// # Errors
+///
+/// Returns an error if server tools, tool choice, or reasoning controls
+/// cannot be represented in the Chat Completions protocol.
 pub(crate) fn to_openai_chat_body(
     model: &str,
     normalized: &NormalizedChat,
@@ -388,6 +424,15 @@ pub(crate) fn to_openai_chat_body(
     to_openai_chat_body_with_profile(model, normalized, request, profile, None)
 }
 
+/// Like [`to_openai_chat_body`], but also resolves reasoning aliases, replay
+/// policy, thinking controls, and token-limit semantics from the given
+/// provider and model profiles.
+///
+/// # Errors
+///
+/// Returns an error if server tools, tool choice, reasoning controls, or
+/// profile-declared request fields cannot be represented in the Chat
+/// Completions protocol.
 pub(crate) fn to_openai_chat_body_with_profile(
     model: &str,
     normalized: &NormalizedChat,
@@ -807,6 +852,9 @@ struct OpenAiToolCallAccumulator {
     arguments: String,
 }
 
+/// Stateful SSE mapper that turns OpenAI Chat Completions stream chunks into
+/// neutral [`StreamEvent`]s, accumulating text, reasoning, tool calls, and
+/// usage until the `[DONE]` sentinel.
 pub(crate) struct OpenAiChatStreamMapper {
     model: String,
     metadata: ResponseMetadata,
@@ -826,10 +874,13 @@ pub(crate) struct OpenAiChatStreamMapper {
 }
 
 impl OpenAiChatStreamMapper {
+    /// Creates a mapper with default reasoning field aliases.
     pub(crate) fn new(model: String, metadata: ResponseMetadata) -> Self {
         Self::with_aliases(model, metadata, ReasoningAliases::default())
     }
 
+    /// Creates a mapper that reads reasoning content from the
+    /// provider-specific delta fields named in `aliases`.
     pub(crate) fn with_aliases(
         model: String,
         metadata: ResponseMetadata,
@@ -854,6 +905,8 @@ impl OpenAiChatStreamMapper {
         }
     }
 
+    /// Attaches a [`CompletionReport`] to the response emitted with
+    /// [`StreamEvent::Done`].
     pub(crate) fn with_report(mut self, report: CompletionReport) -> Self {
         self.report = report;
         self
@@ -1107,10 +1160,24 @@ impl SseMapper for OpenAiChatStreamMapper {
     }
 }
 
+/// Converts an OpenAI Chat Completions JSON response into a neutral
+/// [`ChatResponse`].
+///
+/// # Errors
+///
+/// Returns an error if the payload cannot be parsed into the neutral
+/// representation.
 pub(crate) fn from_openai_chat_response(value: Value) -> Result<ChatResponse> {
     from_openai_chat_response_with_aliases(value, &ReasoningAliases::default())
 }
 
+/// Like [`from_openai_chat_response`], but also extracts reasoning content
+/// from the provider-specific message fields named in `aliases`.
+///
+/// # Errors
+///
+/// Returns an error if the payload cannot be parsed into the neutral
+/// representation.
 pub(crate) fn from_openai_chat_response_with_aliases(
     value: Value,
     aliases: &ReasoningAliases,

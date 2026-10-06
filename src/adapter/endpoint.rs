@@ -59,6 +59,11 @@ pub struct EndpointAdapter {
 pub type OpenAICompatible = EndpointAdapter;
 
 impl EndpointAdapter {
+    /// Create an adapter for the given model and endpoint specification.
+    ///
+    /// The [`EndpointSpec`] selects the wire protocol (OpenAI Chat,
+    /// OpenAI Responses, Anthropic Messages, or Gemini generateContent),
+    /// the request path, and the auth style.
     pub fn new(model: impl Into<String>, endpoint: EndpointSpec) -> Self {
         let provider_profile = endpoint.resolved_profile();
         Self {
@@ -74,21 +79,25 @@ impl EndpointAdapter {
         }
     }
 
+    /// Set an explicit API key, taking precedence over the environment.
     pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
         self
     }
 
+    /// Read the API key from the given environment variable at request time.
     pub fn api_key_from_env(mut self, env_name: impl Into<String>) -> Self {
         self.api_key_env = Some(env_name.into());
         self
     }
 
+    /// Override the retry policy used for failed requests.
     pub fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
         self
     }
 
+    /// Configure transport-level settings (timeouts, proxies, audit hooks).
     pub fn transport(mut self, transport: TransportConfig) -> Self {
         self.transport = transport;
         self
@@ -100,11 +109,13 @@ impl EndpointAdapter {
         self
     }
 
+    /// Add multiple model-level profiles. The first matching profile wins.
     pub fn model_profiles(mut self, profiles: impl IntoIterator<Item = ModelProfile>) -> Self {
         self.model_profiles.extend(profiles);
         self
     }
 
+    /// The endpoint specification this adapter dispatches to.
     pub fn endpoint(&self) -> &EndpointSpec {
         &self.endpoint
     }

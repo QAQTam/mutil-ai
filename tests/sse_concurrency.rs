@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
 use std::thread;

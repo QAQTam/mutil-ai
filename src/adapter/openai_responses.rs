@@ -24,6 +24,18 @@ use crate::types::{
 };
 
 /// Adapter for `POST /v1/responses`.
+///
+/// [`OpenAIResponses`] speaks OpenAI's Responses protocol: neutral
+/// [`ChatRequest`]s are mapped onto the `/v1/responses` body, and outputs
+/// (messages, reasoning items, function calls, and server tool items) are
+/// mapped back to a neutral [`ChatResponse`]. Reasoning items round-trip
+/// through their original provider state, so encrypted reasoning can be
+/// replayed in follow-up turns.
+///
+/// Streaming consumes the Responses event stream (`response.output_text.delta`,
+/// `response.completed`, and related events). Requests are authorized with
+/// `Authorization: Bearer <key>`, where the key comes from
+/// [`OpenAIResponses::api_key`] or the `OPENAI_API_KEY` environment variable.
 pub struct OpenAIResponses {
     model: String,
     api_key: Option<String>,
@@ -34,6 +46,8 @@ pub struct OpenAIResponses {
 }
 
 impl OpenAIResponses {
+    /// Creates a Responses API adapter for `model`, defaulting to OpenAI's
+    /// public endpoint.
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
@@ -45,21 +59,30 @@ impl OpenAIResponses {
         }
     }
 
+    /// Sets the API key sent as `Authorization: Bearer <key>`.
+    ///
+    /// When unset, the `OPENAI_API_KEY` environment variable is used.
     pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
         self
     }
 
+    /// Overrides the API base URL (default `https://api.openai.com/v1`).
+    ///
+    /// The `/responses` path is appended, so this can point at any
+    /// Responses-compatible endpoint.
     pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
 
+    /// Overrides the retry policy applied to transient transport failures.
     pub fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
         self
     }
 
+    /// Sets the transport configuration used when preparing outgoing requests.
     pub fn transport(mut self, transport: TransportConfig) -> Self {
         self.transport = transport;
         self
@@ -320,6 +343,8 @@ impl ModelAdapter for OpenAIResponses {
     }
 }
 
+/// Builds the OpenAI Responses request body (`input`, `instructions`,
+/// `tools`, and sampling controls) from a normalized request.
 pub(crate) fn to_responses_body(
     model: &str,
     normalized: &NormalizedChat,
@@ -439,6 +464,13 @@ pub(crate) fn to_responses_body(
     body
 }
 
+/// Rejects neutral request controls that the Responses protocol cannot
+/// express.
+///
+/// # Errors
+///
+/// Returns [`Error::Unsupported`] when `stop` sequences or `seed` are set,
+/// and propagates tool-choice validation errors.
 pub(crate) fn validate_responses_request(request: &ChatRequest) -> Result<()> {
     validate_tool_choice(&request.tools, request.tool_choice.as_ref())?;
     if !request.stop.is_empty() {
@@ -499,6 +531,9 @@ enum ResponsesPartAccumulator {
     ProviderItem(Value),
 }
 
+/// Stateful SSE mapper for Responses API events, accumulating output items
+/// (text, reasoning, function calls, and server tool items) into a neutral
+/// [`ChatResponse`].
 pub(crate) struct ResponsesStreamMapper {
     model: String,
     metadata: ResponseMetadata,
@@ -513,6 +548,7 @@ pub(crate) struct ResponsesStreamMapper {
 }
 
 impl ResponsesStreamMapper {
+    /// Creates a mapper for the given model and response metadata.
     pub(crate) fn new(model: String, metadata: ResponseMetadata) -> Self {
         Self {
             model,
@@ -528,6 +564,8 @@ impl ResponsesStreamMapper {
         }
     }
 
+    /// Attaches a [`CompletionReport`] to the response emitted with
+    /// [`StreamEvent::Done`].
     pub(crate) fn with_report(mut self, report: CompletionReport) -> Self {
         self.report = report;
         self
@@ -952,6 +990,13 @@ impl SseMapper for ResponsesStreamMapper {
     }
 }
 
+/// Converts an OpenAI Responses API JSON payload into a neutral
+/// [`ChatResponse`].
+///
+/// # Errors
+///
+/// Returns an error if the payload cannot be parsed into the neutral
+/// representation.
 pub(crate) fn from_responses_response(value: Value) -> Result<ChatResponse> {
     let mut parts = Vec::new();
 

@@ -1,95 +1,110 @@
-# mutil-ai（provider-neutral 教学版）
+English | [简体中文](README.zh-CN.md)
 
-一个面向 Rust 初学者的 provider-neutral 模型调用 SDK。
+# mutil-ai (provider-neutral AI SDK)
 
-它的目标不是一次支持所有高级功能，而是先回答一个关键问题：
+A provider-neutral model-invocation SDK for Rust beginners.
 
-> 内部 agent 历史可以很乱，但发到 provider 之前，如何变成干净、严格的 role 和工具配对？
+[![CI](https://github.com/QAQTam/mutil-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/QAQTam/mutil-ai/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/mutil-ai.svg)](https://crates.io/crates/mutil-ai)
+[![docs.rs](https://docs.rs/mutil-ai/badge.svg)](https://docs.rs/mutil-ai)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-这个库不提供 Agent runtime。它自己定义一套很小的中立消息模型，然后让每个
-provider adapter 只负责：
+## Installation
 
-1. 调用归一化层；
-2. 把干净的消息序列化成 provider 的 HTTP 请求；
-3. 把 provider 响应转回中立模型。
+```bash
+cargo add mutil-ai
+```
 
-会话历史、工具执行、权限审批、取消策略和循环步数由下游项目自己决定。仓库中的
-[`examples/minimal_agent.rs`](examples/minimal_agent.rs) 展示如何只使用公开 API
-搭一个最小 Agent runtime；它不是 SDK 的公开能力。
+- Minimum supported Rust version (MSRV): **1.97.1** (see `rust-version` in `Cargo.toml`)
+- Optional feature: `blocking` (provides the blocking `BlockingAdapter` / `BlockingStream`)
+- License: MIT
 
-适配器仍然必须遵守各家的 HTTP 协议，因为不遵守就无法调用；但应用层不需要直接面对这些差异。
 
-国内主要模型的协议面和字段差异汇总见：
+Its goal is not to support every advanced feature at once, but to answer one key question first:
+
+> Internal agent history can be messy — but before it is sent to a provider, how does it become clean, strictly paired roles and tool calls?
+
+This library does not provide an Agent runtime. It defines its own very small neutral message model, and then lets each provider adapter be responsible only for:
+
+1. Invoking the normalization layer;
+2. Serializing the clean messages into the provider's HTTP request;
+3. Converting the provider response back into the neutral model.
+
+Session history, tool execution, permission approval, cancellation policy, and loop step limits are decided by downstream projects. [`examples/minimal_agent.rs`](examples/minimal_agent.rs) in this repository shows how to build a minimal Agent runtime using only the public API; it is not a public capability of the SDK.
+
+Adapters must still follow each provider's HTTP protocol — otherwise the calls simply wouldn't work — but the application layer never has to face those differences directly.
+
+For a summary of protocol surfaces and field differences across major domestic (China) models, see:
 
 - [`docs/provider-compatibility.md`](docs/provider-compatibility.md)
 
-SDK 的长期契约、当前实现和交接清单见：
+For the SDK's long-term contract, current implementation, and handoff checklist, see:
 
 - [`docs/sdk-spec.md`](docs/sdk-spec.md)
 
-供团队研判是否引入的冻结候选 API 语义见：
+For frozen candidate API semantics intended to help teams evaluate adoption, see:
 
 - [`docs/api-freeze-0.2.md`](docs/api-freeze-0.2.md)
-- [`docs/api-freeze-0.1.md`](docs/api-freeze-0.1.md)（历史版本）
+- [`docs/api-freeze-0.1.md`](docs/api-freeze-0.1.md) (historical version)
 
-当前版本的实现交接见：
+For the implementation handoff of the current version, see:
 
 - [`docs/handoff-0.2.md`](docs/handoff-0.2.md)
 
-下游 gateway / agent 的通用扩展能力登记见：
+For a registry of generic extension capabilities required by downstream gateways / agents, see:
 
 - [`docs/consumer-capability-requirements.md`](docs/consumer-capability-requirements.md)
 
-## 1. 核心思想
+## 1. Core idea
 
-### 内部 role
+### Internal roles
 
-应用内部允许出现这些角色：
+Applications may internally use these roles:
 
 ```text
 System / Developer / User / Assistant / Tool / Custom(String)
 ```
 
-这样旧 agent、插件、工作流可以保留自己的语义，不必为了某个 provider 立刻重写历史。
+This lets legacy agents, plugins, and workflows keep their own semantics without having to rewrite their history for some specific provider.
 
-### 出口 role
+### Egress roles
 
-到 provider 之前，只会留下安全角色：
+Before anything reaches a provider, only safe roles remain:
 
 ```text
 System / User / Assistant / Tool
 ```
 
-默认降级规则：
+Default downgrade rules:
 
-| 内部 role | 出口处理 |
+| Internal role | Egress handling |
 |---|---|
-| `System` | 提取为 system instructions |
-| `Developer` | 降级为 `System` |
-| `Custom("...")` | 降级为 `User` |
+| `System` | Extracted as system instructions |
+| `Developer` | Downgraded to `System` |
+| `Custom("...")` | Downgraded to `User` |
 | `User` | `User` |
-| `Assistant` | `Assistant` / Gemini 的 `model` |
-| `Tool` | provider 对应的 tool result |
+| `Assistant` | `Assistant` / Gemini's `model` |
+| `Tool` | The provider's corresponding tool result |
 
-## 2. 工具配对清洗
+## 2. Tool-pairing cleanup
 
-严格 provider 最怕的是“有 tool call，没有 tool result”或者“有 tool result，但没有对应 tool call”。
+What strict providers fear most is "a tool call without a tool result" or "a tool result without a matching tool call".
 
-本库默认规则：
+This library's default rules:
 
-1. assistant 的 `ToolCall` 没有 id：自动补 `call_1`、`call_2`。
-2. tool result 没有 id：按工具名匹配，补上对应 id。
-3. tool call 后面没有 result：自动合成一个错误 result，保证配对完整。
-4. 孤儿 tool result：默认丢弃，避免污染上游。
-5. Anthropic / Gemini：合并相邻 user/assistant 消息，并把 tool result 放进 user turn。
+1. An assistant `ToolCall` without an id: automatically assigned `call_1`, `call_2`, etc.
+2. A tool result without an id: matched by tool name and given the corresponding id.
+3. A tool call with no following result: an error result is synthesized automatically, guaranteeing complete pairing.
+4. Orphan tool results: dropped by default, to avoid polluting upstream.
+5. Anthropic / Gemini: adjacent user/assistant messages are merged, and tool results are placed into the user turn.
 
-可以直接运行示例查看清洗过程：
+You can run the example directly to see the cleanup process:
 
 ```bash
 cargo run --example normalize
 ```
 
-输出会显示：
+The output will show:
 
 ```text
 DowngradedDeveloper
@@ -98,7 +113,7 @@ AssignedToolCallId { name: "get_weather", id: "call_1" }
 SynthesizedMissingToolResult { call_id: "call_1", name: "get_weather" }
 ```
 
-## 3. 最小用法：直接调用模型
+## 3. Minimal usage: calling a model directly
 
 ```rust
 use mutil_ai::{ChatRequest, Message, ModelAdapter, OpenAI};
@@ -119,11 +134,9 @@ async fn main() -> mutil_ai::Result<()> {
 }
 ```
 
-`OPENAI_API_KEY` 从环境变量读取。这里的 `ModelAdapter` 就是下游项目应直接调用的
-稳定边界：传入 `ChatRequest`，得到 `ChatResponse`；需要请求级 header、取消或
-transform 时改用 `complete_with`。
+`OPENAI_API_KEY` is read from the environment. `ModelAdapter` here is the stable boundary downstream projects should call directly: pass in a `ChatRequest`, get back a `ChatResponse`; use `complete_with` when you need request-level headers, cancellation, or transforms.
 
-切换 provider 不需要改业务请求代码：
+Switching providers requires no changes to business request code:
 
 ```rust
 let model = OpenAI::chat("gpt-4.1");
@@ -132,71 +145,67 @@ let model = OpenAI::chat("gpt-4.1");
 // let model = mutil_ai::Gemini::generate_content("gemini-3-flash");
 ```
 
-## 4. 最小 Agent runtime：示例而非库能力
+## 4. Minimal Agent runtime: an example, not a library capability
 
-SDK 不导出 `Agent`、`AgentBuilder`、`ToolRegistry` 或 `tool_fn`。这些类型会把
-历史存储、工具注册、权限模型和终止策略固化到库中，不适合作为通用 provider
-core 的稳定 API。
+The SDK does not export `Agent`, `AgentBuilder`, `ToolRegistry`, or `tool_fn`. Those types would bake history storage, tool registration, permission models, and termination policy into the library — not a good fit as a stable API for a general-purpose provider core.
 
-完整的最小 runtime 位于：
+The complete minimal runtime lives at:
 
 [`examples/minimal_agent.rs`](examples/minimal_agent.rs)
 
-它只依赖本 crate 的公开类型，并实现：
+It depends only on this crate's public types, and implements:
 
-1. 本地保存 `Vec<Message>` 历史；
-2. 把系统提示和 `ToolSpec` 放进 `ChatRequest`；
-3. 调用 `ModelAdapter::complete_with`；
-4. 执行本地工具并追加 `Message::tool_results`；
-5. 最多循环 `max_steps` 次。
+1. Keeping the `Vec<Message>` history locally;
+2. Putting the system prompt and `ToolSpec`s into a `ChatRequest`;
+3. Calling `ModelAdapter::complete_with`;
+4. Executing local tools and appending `Message::tool_results`;
+5. Looping at most `max_steps` times.
 
-运行：
+Run it:
 
 ```bash
 cargo run --example minimal_agent
 ```
 
-其他项目可以复制这个文件作为起点，再替换成自己的权限审批、取消、审计和工具
-调度实现，不需要修改或扩展 SDK 的公共 API。
+Other projects can copy this file as a starting point and then substitute their own permission approval, cancellation, auditing, and tool dispatch implementations — no need to modify or extend the SDK's public API.
 
-## 5. 统一思考链：message 与 reasoning
+## 5. Unified chain of thought: message vs. reasoning
 
-各家返回思考内容时，字段名和容器都不一样：
+Each provider returns thinking content with different field names and containers:
 
-| 协议 | 原始字段 |
+| Protocol | Raw fields |
 |---|---|
-| OpenAI Chat 兼容接口 | `message.reasoning_content`、`message.reasoning`、`message.reasoning_details` |
-| OpenAI Responses | output item `type = "reasoning"`，其中可有 `summary`、`content`、`encrypted_content` |
-| Anthropic Messages | content block `thinking` / `redacted_thinking`，其中 `signature` / `data` 必须原样回传 |
-| Gemini generateContent | part `thought: true`、`thoughtSignature`；签名也可能挂在 `functionCall` part 上 |
+| OpenAI Chat-compatible API | `message.reasoning_content`, `message.reasoning`, `message.reasoning_details` |
+| OpenAI Responses | output item `type = "reasoning"`, which may contain `summary`, `content`, `encrypted_content` |
+| Anthropic Messages | content blocks `thinking` / `redacted_thinking`, where `signature` / `data` must be passed back verbatim |
+| Gemini generateContent | part `thought: true`, `thoughtSignature`; the signature may also be attached to a `functionCall` part |
 
-应用层不需要判断这些字段。响应统一变成：
+The application layer never needs to inspect these fields. Responses are uniformly turned into:
 
 ```rust
-Part::Text { text, provider_state }        // 给用户看的最终消息；state 可携带 Gemini 签名
-Part::Reasoning(Reasoning {                 // 思考上下文或摘要
+Part::Text { text, provider_state }        // final message shown to the user; state may carry a Gemini signature
+Part::Reasoning(Reasoning {                 // thinking context or summary
     kind: ReasoningKind,
     summary: Option<String>,
     text: Option<String>,
     state: Option<ProviderState>,
 })
-Part::ToolCall(call)                        // 工具调用
-Part::ToolResult(result)                    // 工具结果
+Part::ToolCall(call)                        // tool call
+Part::ToolResult(result)                    // tool result
 ```
 
-`ReasoningKind` 只有四种：
+`ReasoningKind` has exactly four variants:
 
 ```text
-Summary    // 摘要，例如 OpenAI Responses summary
-Text       // 可读思考文本，例如 Anthropic thinking / Gemini thought
-Encrypted  // 加密推理状态，用户不可读
-Redacted   // 安全策略抹除的块
+Summary    // a summary, e.g. OpenAI Responses summary
+Text       // human-readable thinking text, e.g. Anthropic thinking / Gemini thought
+Encrypted  // encrypted reasoning state, unreadable to the user
+Redacted   // blocks removed by safety policy
 ```
 
-`state` 是 provider 专用的不透明数据，里面可能包含 OpenAI reasoning item、
-Anthropic `signature`、Gemini `thoughtSignature` 等。应用不要解析或修改它。
+`state` is provider-specific opaque data; it may contain OpenAI reasoning items, Anthropic `signature`, Gemini `thoughtSignature`, etc. Applications should not parse or modify it.
 
-下游可以只做这种匹配：
+Downstream code only needs to match like this:
 
 ```rust
 for part in &response.message.parts {
@@ -215,16 +224,15 @@ for part in &response.message.parts {
 }
 ```
 
-`response.text()` 和 `message.text_content()` 永远不包含 reasoning，避免把思考过程
-误当最终答案。可运行：
+`response.text()` and `message.text_content()` never include reasoning, preventing the thinking process from being mistaken for the final answer. To try it:
 
 ```bash
 cargo run --example reasoning
 ```
 
-### 请求配置也统一
+### Request configuration is unified too
 
-不同 provider 的开关同样由 adapter 映射：
+Per-provider toggles are likewise mapped by the adapter:
 
 ```rust
 use mutil_ai::{
@@ -241,16 +249,16 @@ let request = ChatRequest::user("分析这个问题")
     );
 ```
 
-映射规则：
+Mapping rules:
 
-- OpenAI Chat：`effort` -> `reasoning_effort`
-- OpenAI Responses：`effort/summary/include_encrypted` -> `reasoning` 与 `include`
-- Anthropic：`mode/budget_tokens/include_text` -> `thinking`
-- Gemini：`effort/budget_tokens/include_text` -> `generationConfig.thinkingConfig`
+- OpenAI Chat: `effort` -> `reasoning_effort`
+- OpenAI Responses: `effort/summary/include_encrypted` -> `reasoning` and `include`
+- Anthropic: `mode/budget_tokens/include_text` -> `thinking`
+- Gemini: `effort/budget_tokens/include_text` -> `generationConfig.thinkingConfig`
 
-不支持的目标字段会忽略，不会猜一个近似字段塞进去。
+Unsupported target fields are ignored — the library never guesses an approximate field and stuffs the value in there.
 
-常用请求控制也有中立表达：
+Common request controls also have a neutral representation:
 
 ```rust
 use mutil_ai::{ResponseFormat, ToolChoice};
@@ -274,21 +282,20 @@ let request = ChatRequest::user("返回结构化天气结果")
     .seed(42);
 ```
 
-各协议只映射自己支持的字段；例如 Anthropic 不接受中立
-`response_format`，会返回 `Unsupported`，不会静默忽略。
+Each protocol maps only the fields it supports; for example, Anthropic does not accept the neutral `response_format` and will return `Unsupported` rather than silently ignoring it.
 
-### 回放边界
+### Replay boundaries
 
-- 同一协议的 reasoning `state` 会原样回放。
-- Anthropic 的 `thinking` / `redacted_thinking` 按原顺序放回 assistant content。
-- OpenAI Responses 的 reasoning item 按原对象放回 `input`。
-- Gemini 的 `thoughtSignature` 保留在对应 reasoning part、tool call 或可见 text part 上。
-- 跨协议的 opaque state 默认在归一化层丢弃，绝不把 Claude/Gemini 签名发给 OpenAI。
-- 非 assistant 消息里的 reasoning 默认丢弃并写进 `NormalizeReport`，不会悄悄提升成用户文本。
+- Reasoning `state` from the same protocol is replayed verbatim.
+- Anthropic's `thinking` / `redacted_thinking` blocks are placed back into the assistant content in their original order.
+- OpenAI Responses reasoning items are placed back into `input` as the original objects.
+- Gemini's `thoughtSignature` is preserved on the corresponding reasoning part, tool call, or visible text part.
+- Opaque state across protocols is dropped by default in the normalization layer — Claude/Gemini signatures are never sent to OpenAI.
+- Reasoning inside non-assistant messages is dropped by default and recorded in `NormalizeReport`; it is never silently promoted into user text.
 
-这样出口仍然只认识一套简单内容类型，provider 特例被限制在 adapter 内。
+This way the egress layer still only knows one simple set of content types, and provider special cases are confined to adapters.
 
-参考入口：
+Reference links:
 
 - OpenAI Reasoning: <https://developers.openai.com/api/docs/guides/reasoning>
 - Anthropic Extended Thinking: <https://platform.claude.com/docs/en/build-with-claude/extended-thinking>
@@ -296,9 +303,9 @@ let request = ChatRequest::user("返回结构化天气结果")
 - Gemini Thought Signatures: <https://ai.google.dev/gemini-api/docs/thought-signatures>
 - OpenRouter Reasoning Tokens: <https://openrouter.ai/docs/use-cases/reasoning-tokens>
 
-## 6. 统一 streaming
+## 6. Unified streaming
 
-四个内置 adapter 都实现了：
+All four built-in adapters implement:
 
 ```rust
 async fn stream_with(
@@ -308,7 +315,7 @@ async fn stream_with(
 ) -> Result<ModelStream>;
 ```
 
-下游只看统一的 `StreamEvent`：
+Downstream code only sees the unified `StreamEvent`:
 
 ```rust
 pub enum StreamEvent {
@@ -343,7 +350,7 @@ pub enum StreamEvent {
 }
 ```
 
-调用示例：
+Usage example:
 
 ```rust
 use mutil_ai::{ChatRequest, ModelAdapter, OpenAI, StreamEvent, next_event};
@@ -368,29 +375,28 @@ while let Some(event) = next_event(&mut stream).await {
 }
 ```
 
-已经处理的关键问题：
+Key problems already handled:
 
-- OpenAI Chat：`delta.content`、`reasoning_content`、`reasoning_details`
-- OpenAI Responses：text / reasoning summary / reasoning text / function arguments 事件
-- Anthropic：`content_block_delta`、`thinking_delta`、`signature_delta`、`input_json_delta`
-- Gemini：`:streamGenerateContent?alt=sse`、thought、text、functionCall、thoughtSignature
-- 工具参数按 index 累积，并在 `Done.response` 中解析成 JSON
-- reasoning 文本与最终签名/encrypted state 在 `Done.response` 中保持完整
-- usage 单独发送，并同时保存在最终 response
-- `Start.metadata` 和 `Done.response.metadata` 包含 status、request id 和 response headers
-- SSE 的 `retry:` 字段映射成 `StreamEvent::Retry`
+- OpenAI Chat: `delta.content`, `reasoning_content`, `reasoning_details`
+- OpenAI Responses: text / reasoning summary / reasoning text / function arguments events
+- Anthropic: `content_block_delta`, `thinking_delta`, `signature_delta`, `input_json_delta`
+- Gemini: `:streamGenerateContent?alt=sse`, thought, text, functionCall, thoughtSignature
+- Tool arguments are accumulated by index and parsed into JSON in `Done.response`
+- Reasoning text and the final signature/encrypted state remain intact in `Done.response`
+- Usage is sent as its own event and also kept in the final response
+- `Start.metadata` and `Done.response.metadata` include status, request id, and response headers
+- The SSE `retry:` field is mapped to `StreamEvent::Retry`
 
-当前边界：
+Current boundaries:
 
-- 开始接收流之前的 HTTP 错误会按 `RetryPolicy` 重试。
-- 流开始后的 transport 断线可以显式启用 reconnect。
-- reconnect 必须看到 SSE `id`，会携带 `Last-Event-ID`，并复用同一个 mapper。
-- 已收到重复的 `(id, data)` 会被去重，避免重连后重复文本或工具参数。
-- 只有 Chat/Gemini 允许把 EOF 当正常结束；Responses/Anthropic 未看到终止事件时
-  会把它视为可恢复断线。
-- `collect_stream` 可以忽略增量渲染，直接收集最终 `ChatResponse`。
+- HTTP errors before the stream starts receiving are retried according to `RetryPolicy`.
+- Transport disconnections after the stream starts can be handled with explicitly enabled reconnect.
+- Reconnect requires seeing an SSE `id`, sends `Last-Event-ID`, and reuses the same mapper.
+- Duplicate `(id, data)` pairs already received are deduplicated, avoiding repeated text or tool arguments after a reconnect.
+- Only Chat/Gemini treat EOF as a normal end; Responses/Anthropic treat an EOF without a terminal event as a recoverable disconnect.
+- `collect_stream` lets you skip incremental rendering and simply collect the final `ChatResponse`.
 
-启用断线重连：
+Enabling disconnect reconnect:
 
 ```rust
 use std::time::Duration;
@@ -406,48 +412,48 @@ let options = RequestOptions::new().stream_reconnect(
 let mut stream = model.stream_with(&request, &options).await?;
 ```
 
-重连时会发送：
+On reconnect the following is sent:
 
 ```http
 Last-Event-ID: <last-seen-id>
 ```
 
-session、idempotency key 和原始 request body 保持不变。
+Session, idempotency key, and the original request body remain unchanged.
 
-可运行示例：
+Runnable example:
 
 ```bash
 cargo run --example streaming
 ```
 
-## 7. Retry 头怎么识别
+## 7. How retry headers are recognized
 
-`Retry-After` 是 HTTP response header，不是 body。常见于：
+`Retry-After` is an HTTP response header, not a body field. It commonly appears with:
 
 - `429 Too Many Requests`
 - `503 Service Unavailable`
 
-它有两种格式：
+It has two formats:
 
 ```http
 Retry-After: 120
 ```
 
-表示等 120 秒。
+meaning wait 120 seconds.
 
 ```http
 Retry-After: Wed, 21 Oct 2026 07:28:00 GMT
 ```
 
-表示等到这个 HTTP 日期。日期已经过去时，等待时间按 0 处理。
+meaning wait until this HTTP date. If the date is already in the past, the wait time is treated as 0.
 
-本库会：
+This library will:
 
-1. 检查 response 的 `retry-after` header；
-2. 先尝试按秒数解析；
-3. 失败后按 HTTP date 解析；
-4. 保存到 `Error::Api.retry_after`；
-5. 通过 `error.retry_after()` 和 `error.is_retryable()` 提供给重试逻辑。
+1. Check the response's `retry-after` header;
+2. First try to parse it as a number of seconds;
+3. Fall back to parsing it as an HTTP date;
+4. Store it in `Error::Api.retry_after`;
+5. Expose it to retry logic via `error.retry_after()` and `error.is_retryable()`.
 
 ```rust
 use std::time::Duration;
@@ -464,7 +470,7 @@ match model.complete(&request).await {
 }
 ```
 
-错误本身有稳定分类，不需要匹配错误字符串：
+Errors carry a stable classification, so there is no need to match on error strings:
 
 ```rust
 use mutil_ai::ErrorKind;
@@ -481,32 +487,28 @@ match model.complete(&request).await {
 }
 ```
 
-`Error` 还提供：
+`Error` also provides:
 
-- `kind()`：稳定的 `ErrorKind`；
-- `status()`：HTTP status；
-- `provider()`：provider 名称；
-- `request_id()`：响应中可用的 request id；
-- `retry_after()` / `retry_source()`；
-- `is_retryable()`；
-- `body_bytes()`：provider 错误 body 的字节数；
-- `provider_error()`：安全的结构化错误摘要；
-- `raw_body()`：显式读取 provider 原始错误 body。
+- `kind()`: the stable `ErrorKind`;
+- `status()`: the HTTP status;
+- `provider()`: the provider name;
+- `request_id()`: the request id from the response, if available;
+- `retry_after()` / `retry_source()`;
+- `is_retryable()`;
+- `body_bytes()`: the byte length of the provider error body;
+- `provider_error()`: a safe structured error summary;
+- `raw_body()`: explicitly read the provider's raw error body.
 
-`provider_error()` 兼容常见 OpenAI/Anthropic/Gemini 及兼容网关结构，返回经过
-长度和字符白名单清洗的 `code`、`error_type`、`status`、message 字节数和
-details 数量；不返回 provider message 原文。
+`provider_error()` understands common OpenAI/Anthropic/Gemini structures as well as compatible gateways, and returns a length- and character-whitelist-sanitized `code`, `error_type`, `status`, message byte count, and details count; it does not return the provider message verbatim.
 
-`Error::Api` 的 `Display` 和 `Debug` 默认不会输出 provider body，避免 `eprintln!`
-或日志框架意外记录被回显的 prompt、账号信息或工具内容。只有显式调用
-`raw_body()` 或直接访问字段才会取得原文。
+By default, `Error::Api`'s `Display` and `Debug` do not output the provider body, preventing `eprintln!` or logging frameworks from accidentally recording echoed prompts, account information, or tool content. Only an explicit call to `raw_body()` or direct field access retrieves the raw text.
 
-### RetryPolicy 设计
+### RetryPolicy design
 
-重试逻辑分三层：
+Retry logic is layered in three tiers:
 
 ```text
-Retry-After / 状态码
+Retry-After / status code
         ↓
 RetryPolicy::delay_for()
         ↓
@@ -515,7 +517,7 @@ retry_async / send_json_retry
 adapter
 ```
 
-adapter 不自己决定 sleep 多久，只负责重建 HTTP request。
+The adapter never decides how long to sleep itself; it is only responsible for rebuilding the HTTP request.
 
 ```rust
 use mutil_ai::{OpenAI, RetryPolicy};
@@ -531,17 +533,16 @@ let model = OpenAI::responses("gpt-5.2").retry_policy(
 );
 ```
 
-规则：
+Rules:
 
-1. 只有 `error.is_retryable()` 为 true 才重试。
-2. 有 `Retry-After`：优先遵守服务端时间。
-3. `Retry-After` 超过 `max_retry_after`：停止，避免无限等待。
-4. 没有 `Retry-After`：指数退避，并加 jitter。
-5. `max_attempts` 包含第一次请求。
-6. 默认 `require_idempotency_key = true`：没有 `Idempotency-Key` 时只发送一次，
-   不自动重放 POST。
+1. Retry only when `error.is_retryable()` is true.
+2. If `Retry-After` is present: respect the server-provided time first.
+3. If `Retry-After` exceeds `max_retry_after`: stop, to avoid waiting forever.
+4. If there is no `Retry-After`: exponential backoff with jitter.
+5. `max_attempts` includes the first request.
+6. By default `require_idempotency_key = true`: without an `Idempotency-Key`, the request is sent once and POSTs are not replayed automatically.
 
-显式接受无幂等键重试：
+Explicitly accepting retries without an idempotency key:
 
 ```rust
 let policy = RetryPolicy::default()
@@ -549,49 +550,48 @@ let policy = RetryPolicy::default()
     .require_idempotency_key(false);
 ```
 
-只有明确知道请求可安全重放时才关闭这个保护。
+Only turn off this protection when you know for certain the request can be safely replayed.
 
-### Header 优先级
+### Header priority
 
-解析顺序固定为：
+The parsing order is fixed:
 
 ```text
 1. retry-after-ms
 2. retry-after
-3. provider 专属 reset header
+3. provider-specific reset headers
 ```
 
-`retry-after-ms` 虽然不是标准头，但 OpenAI、Anthropic、Google 的官方 SDK
-都支持，而且精度比整数秒高。
+`retry-after-ms` is not a standard header, but the official OpenAI, Anthropic, and Google SDKs all support it, and it has better precision than whole seconds.
 
 ### OpenAI
 
-官方 OpenAPI 中，`429` 和 `503` 响应会返回：
+In the official OpenAPI spec, `429` and `503` responses return:
 
 ```http
 Retry-After: 3
 ```
 
-官方 Python SDK 还会优先识别：
+The official Python SDK also recognizes, with priority:
 
 ```http
 retry-after-ms: 1500
 ```
 
-作为兜底，本库支持：
+As a fallback, this library also supports:
 
 ```http
 x-ratelimit-reset-requests: 6m0s
 x-ratelimit-reset-tokens: 1h
 ```
 
-支持 `ns / us / µs / ms / s / m / h` 以及组合形式，例如 `1h30m`。
+Supporting `ns / us / µs / ms / s / m / h` as well as combined forms, e.g. `1h30m`.
 
 ### Anthropic
 
-官方 SDK 同样优先识别 `retry-after-ms`，然后是 `retry-after`。
+The official SDK likewise prefers `retry-after-ms`, then `retry-after`.
 
-Anthropic 的 reset header 是 RFC3339 UTC 时间：
+Anthropic's reset headers are RFC3339 UTC timestamps:
 
 ```http
 anthropic-ratelimit-requests-reset: 2026-02-25T20:02:32Z
@@ -602,24 +602,23 @@ anthropic-ratelimit-output-tokens-reset: 2026-02-25T20:02:36Z
 
 ### Google Gemini
 
-官方 `python-genai` SDK 支持：
+The official `python-genai` SDK supports:
 
 ```http
 retry-after-ms: 1
 ```
 
-Google API 的错误 body 也可能包含 `RetryInfo.retryDelay`，但它不是 header，
-因此当前版本先不把它混进 header 解析层。
+Google API error bodies may also contain `RetryInfo.retryDelay`, but that is not a header, so the current version does not mix it into the header-parsing layer.
 
-参考入口：
+Reference links:
 
 - OpenAI Rate Limits: <https://developers.openai.com/api/docs/guides/rate-limits>
 - Anthropic Rate Limits: <https://platform.claude.com/docs/en/api/rate-limits>
 - Gemini Rate Limits: <https://ai.google.dev/gemini-api/docs/rate-limits>
 
-## 8. 手写 SSE parser
+## 8. Hand-written SSE parser
 
-`src/sse.rs` 是一个增量式、零 I/O 的 SSE parser：
+`src/sse.rs` is an incremental, zero-I/O SSE parser:
 
 ```rust
 let mut parser = SseParser::new();
@@ -633,67 +632,64 @@ for chunk in response.bytes_stream() {
 }
 ```
 
-它不依赖 `sse-stream`、`tokio-util` 或 `http-body`，只处理字节状态。
+It does not depend on `sse-stream`, `tokio-util`, or `http-body`; it only handles byte state.
 
-支持：
+Supported:
 
-- chunk 任意切分
-- `\n`、`\r\n`、单独 `\r`
+- Arbitrary chunk splits
+- `\n`, `\r\n`, and lone `\r`
 - UTF-8 BOM
-- 注释和未知字段
-- 多行 `data`
-- `event`、`id`、`retry`
-- `id` 跨事件继承
-- `event` 在 dispatch 后重置
-- line/event 大小限制
-- EOF 丢弃未完成事件
+- Comments and unknown fields
+- Multi-line `data`
+- `event`, `id`, `retry`
+- `id` inheritance across events
+- `event` reset after dispatch
+- Line/event size limits
+- Incomplete events discarded at EOF
 
-UTF-8 默认遵循 WHATWG EventSource：非法字节替换为 U+FFFD。需要
-`sse-stream` 风格的严格报错时使用：
+UTF-8 handling follows WHATWG EventSource by default: invalid bytes are replaced with U+FFFD. For `sse-stream`-style strict errors, use:
 
 ```rust
 let parser = SseParser::strict();
 ```
 
-正确性测试覆盖：
+Correctness tests cover:
 
-- 每个字节边界切分
-- CRLF 跨 chunk
-- BOM 跨 chunk
-- 多行 data
-- ID 继承
-- event 重置
-- retry 非法值和溢出
-- NUL ID
-- colonless data
+- Splitting at every byte boundary
+- CRLF across chunks
+- BOM across chunks
+- Multi-line data
+- ID inheritance
+- Event reset
+- Invalid retry values and overflow
+- NUL IDs
+- Colonless data
 - UTF-8 replace / strict
-- CJK 在 codepoint 中间被切开
-- emoji 在 codepoint 中间被切开
+- CJK split in the middle of a codepoint
+- Emoji split in the middle of a codepoint
 - CJK event/id/data
-- line limit 按 UTF-8 字节数计算
-- BOM 后接 CJK
-- EOF 未完成事件
+- Line limits counted in UTF-8 bytes
+- BOM followed by CJK
+- Incomplete events at EOF
 
-和 `sse-stream 0.3.0` 的对照测试：
+Comparison tests against `sse-stream 0.3.0`:
 
 ```bash
 cargo test --test sse_compare -- --ignored --nocapture
 cargo test --test sse_concurrency -- --ignored --nocapture
 ```
 
-第一个测试模拟 200,000 个 token，也就是 10,000 tok/s 持续 20 秒的流，
-分别测量 1 / 10 / 100 个事件一个 chunk。
+The first test simulates 200,000 tokens — a 10,000 tok/s stream sustained for 20 seconds — measured at 1 / 10 / 100 events per chunk.
 
-第二个测试按机器逻辑 CPU 数动态选择 1 / 4 / 8 / 12 个并发客户端，
-每个客户端解析 300,000 个 token，测量：
+The second test dynamically selects 1 / 4 / 8 / 12 concurrent clients based on the machine's logical CPU count; each client parses 300,000 tokens, measuring:
 
-- worker CPU 时间
-- 每 token CPU 时间
-- 轮次间 CPU 变异系数
-- 客户端间 CPU 变异系数
-- 相对 10,000 tok/s 的 CPU 余量
+- Worker CPU time
+- CPU time per token
+- CPU coefficient of variation across rounds
+- CPU coefficient of variation across clients
+- CPU headroom relative to 10,000 tok/s
 
-当前机器结果：
+Results on the current machine:
 
 ```text
 1-8 clients:
@@ -710,20 +706,17 @@ cargo test --test sse_concurrency -- --ignored --nocapture
   两种 parser 相对 10,000 tok/s 都有约 85x-230x CPU 余量
 ```
 
-这说明 10,000 tok/s 本身远远达不到 SSE parser 的饱和点。真正让 CPU
-产生波动的主要会是 JSON、网络、模型服务、日志和上层 agent 调度，而不是
-SSE 字节解析。并发饱和时，内存分配器、SMT 和调度器的影响会开始超过 parser
-本身。
+This shows that 10,000 tok/s is nowhere near the SSE parser's saturation point. What actually drives CPU fluctuation is mainly JSON, networking, the model service, logging, and upper-level agent scheduling — not SSE byte parsing. Under concurrent saturation, the memory allocator, SMT, and the scheduler begin to matter more than the parser itself.
 
-### 与 qaqh-gate `SseDecoder` 的隔离对比
+### Isolated comparison against qaqh-gate's `SseDecoder`
 
-在独立 worktree 中直接比较了 qaqh 的 data-only decoder 与本库通用 parser：
+In a separate worktree, qaqh's data-only decoder was compared directly against this library's general-purpose parser:
 
 ```text
 release, 500,000 events, 5 samples
 ```
 
-优化后：
+After optimization:
 
 ```text
 ASCII:
@@ -737,7 +730,7 @@ CJK + emoji:
   差距约 1.34x-1.42x
 ```
 
-多客户端：
+Multiple clients:
 
 ```text
 1-8 clients:
@@ -748,53 +741,52 @@ CJK + emoji:
   主要来自分配器、SMT 和调度竞争
 ```
 
-qaqh 的 decoder 只处理 `data:`，不保留 event/id/retry，不执行严格 UTF-8
-策略，因此它更快是预期结果；本库保留了完整 SSE 语义和 reconnect 所需状态。
+qaqh's decoder only handles `data:`, does not preserve event/id/retry, and does not enforce a strict UTF-8 policy, so it being faster is the expected outcome; this library keeps full SSE semantics and the state needed for reconnect.
 
-### 10,000 session 压测
+### 10,000-session stress test
 
-新增：
+Added:
 
 ```bash
 cargo test --test sse_sessions
 cargo test --test sse_sessions -- --ignored --nocapture
 ```
 
-测试模型：
+Test model:
 
-- 10,000 个 parser 状态同时存活；
-- 12 个 worker 轮转推进；
-- 每个 session 独立解析；
-- 校验事件总数，任何丢失都会失败；
-- 常规 smoke test 每次提交运行；
-- 100 events/session 的 heavy 版本标记为 ignored。
+- 10,000 parser states alive simultaneously;
+- 12 workers rotating through sessions;
+- Each session parsed independently;
+- Total event counts verified — any loss fails the test;
+- The regular smoke test runs on every commit;
+- The heavy version with 100 events/session is marked ignored.
 
-当前机器 release 结果：
+Current release results on this machine:
 
 ```text
 qaqh:    约 46M-60M events/s
 mutil-ai: 约 17M-18M events/s
 ```
 
-按网站常见 10,000 并发 session、每 session 平均 10-100 events/s 估算：
+Based on a typical website workload of 10,000 concurrent sessions with an average of 10-100 events/s per session:
 
 ```text
 总事件率约 100k-1M events/s
 mutil-ai 仍有约 17x-170x 的解析余量
 ```
 
-因此万 session 的目标不是 SSE parser 瓶颈，而是：
+So the ten-thousand-session target is not bottlenecked by the SSE parser; the real constraints are:
 
-- 每 session 的内存占用；
-- async task 数量和调度；
-- 网络连接/TLS；
-- JSON 与业务状态机；
-- 日志和审计管线。
+- Per-session memory footprint;
+- Async task count and scheduling;
+- Network connections/TLS;
+- JSON and business state machines;
+- Logging and audit pipelines.
 
 
-## 9. Header 与 User-Agent
+## 9. Headers and User-Agent
 
-SDK 提供默认 UA，但允许客户端覆盖：
+The SDK provides a default UA, but clients may override it:
 
 ```rust
 let transport = TransportConfig::new()
@@ -808,7 +800,7 @@ let transport = TransportConfig::new()
 let model = OpenAI::responses("gpt-5.2").transport(transport);
 ```
 
-请求级 header：
+Request-level headers:
 
 ```rust
 let options = RequestOptions::new()
@@ -817,9 +809,9 @@ let options = RequestOptions::new()
     .context(RequestContext::new().session_id(session_id));
 ```
 
-`x-sessionid`、`x-tenant-id` 这类业务字段不写死进 adapter，由客户端透传。
+Business fields like `x-sessionid` and `x-tenant-id` are not hard-coded into adapters; clients pass them through.
 
-动态认证或 session header 通过 `HeaderInjector`：
+Dynamic auth or session headers go through `HeaderInjector`:
 
 ```rust
 use std::sync::Arc;
@@ -851,7 +843,7 @@ let transport = TransportConfig::new()
     .header_injector(Arc::new(GatewayInjector));
 ```
 
-Header 优先级：
+Header priority:
 
 ```text
 SDK 默认 UA
@@ -863,29 +855,23 @@ RequestOptions
 HeaderInjector
 ```
 
-`Authorization`、`Content-Type`、`Content-Length`、`Host`、`Accept`
-默认是 protected header，普通配置层不能静默覆盖。`HeaderInjector` 属于受信任的
-transport 配置，可以设置 `Authorization`，适合 OAuth/token refresh 场景。
+`Authorization`, `Content-Type`, `Content-Length`, `Host`, and `Accept` are protected headers by default and cannot be silently overridden by ordinary configuration layers. `HeaderInjector` is part of the trusted transport configuration and may set `Authorization`, making it suitable for OAuth/token refresh scenarios.
 
-幂等请求可以传：
+For idempotent requests, pass:
 
 ```rust
 let options = RequestOptions::new().idempotency_key("request-123");
 ```
 
-SDK 会发送 `Idempotency-Key: request-123`，同一个逻辑请求重试时沿用同一个 key。
+The SDK sends `Idempotency-Key: request-123`, and retries of the same logical request reuse the same key.
 
-自定义 header 默认要求 ASCII。CJK 等非 ASCII 值需要由调用方自行编码，
-例如 base64 或 percent encoding；否则返回 `NonAsciiHeaderValue`。
+Custom headers must be ASCII by default. Non-ASCII values such as CJK must be encoded by the caller — e.g. base64 or percent encoding; otherwise `NonAsciiHeaderValue` is returned.
 
-`HeaderInjector` 会在每次 HTTP attempt 前重新执行。自动重试可以刷新 token 或
-临时 header，但 session、idempotency key、静态 body 和静态 headers 仍保持同一
-逻辑请求的稳定性。已经产生 stream delta 后仍不会自动重放。
+`HeaderInjector` is re-executed before every HTTP attempt. Automatic retries can refresh tokens or transient headers, but session, idempotency key, static body, and static headers remain stable for the same logical request. Automatic replay is still not performed once stream deltas have been produced.
 
-### 审计与数据点（无上下文留痕）
+### Auditing and data points (no context retention)
 
-审计默认关闭；启用后只记录结构化传输事件，不记录 prompt、message、
-reasoning、tool arguments/result、request body 或 response body：
+Auditing is off by default; when enabled, it records only structured transport events — never prompts, messages, reasoning, tool arguments/results, request bodies, or response bodies:
 
 ```rust
 use std::sync::Arc;
@@ -905,7 +891,7 @@ let transport = TransportConfig::new()
     .audit_config(AuditConfig::enabled());
 ```
 
-可审计数据点包括：
+Auditable data points include:
 
 - `RequestStarted`
 - `AttemptStarted`
@@ -915,47 +901,38 @@ let transport = TransportConfig::new()
 - `Normalization`
 - `RetryScheduled`
 - `StreamReconnectScheduled`
-- `RequestFinished`（`Success` / `Failure` / `Cancelled`）
+- `RequestFinished` (`Success` / `Failure` / `Cancelled`)
 
-每条事件可包含：
+Each event may include:
 
-- provider、protocol、model；
-- attempt 编号；
-- status、耗时、outcome；
-- response headers 到达耗时与流式 TTFT；
-- request body 字节数与累计 decoded response body 字节数；
-- `ErrorKind`、是否 retryable；
-- usage；
-- provider request id；
-- normalization 修复类型的聚合数量；
-- 显式开启后包含 profile id / model profile 命中状态 / capability 快照。
+- provider, protocol, model;
+- attempt number;
+- status, duration, outcome;
+- time to response headers and streaming TTFT;
+- request body byte count and cumulative decoded response body byte count;
+- `ErrorKind` and whether it is retryable;
+- usage;
+- provider request id;
+- aggregate counts of normalization fix types;
+- profile id / model profile hit status / capability snapshot, only when explicitly enabled.
 
-`ResponseHeaders.elapsed` 和 `RequestFinished.timing.time_to_headers` 从逻辑请求
-开始计时。它们包含 DNS、连接、TLS、请求发送和服务端处理到响应头到达的总时间；
-reqwest 没有向本 SDK 暴露这些阶段的独立时刻，所以不会伪造更细的 connect/TLS
-拆分。`time_to_first_token` 仅在流式响应收到首个 text、reasoning 或 tool-call
-delta 时产生。
+`ResponseHeaders.elapsed` and `RequestFinished.timing.time_to_headers` are measured from the start of the logical request. They include the total time for DNS, connection, TLS, request sending, and server processing until the response headers arrive; reqwest does not expose the individual timestamps of these stages to this SDK, so finer-grained connect/TLS splits are not fabricated. `time_to_first_token` is produced only when a streaming response receives its first text, reasoning, or tool-call delta.
 
-`Normalization` 只包含每类修复的计数，例如 developer 降级、tool call/result
-补对。它不会记录自定义 role 名、tool 名、call id 或消息内容。
+`Normalization` contains only counts per fix type, e.g. developer downgrades and tool call/result pairing repairs. It never records custom role names, tool names, call ids, or message content.
 
-`RequestFinished.bytes.request_body` 是一次 attempt 的序列化 body 大小；
-`bytes.response_body` 是本次逻辑请求跨重试/reconnect 收到的累计 decoded 字节数，
-包含 provider error body，但不包含正文内容。
+`RequestFinished.bytes.request_body` is the size of the serialized body of a single attempt; `bytes.response_body` is the cumulative decoded byte count received across retries/reconnects for this logical request, including provider error bodies but excluding body content.
 
-流在收到 terminal event 前被消费者 drop 时，会发出
-`RequestFinished { outcome: Cancelled }`。可用 `record_cancellation(false)`
-关闭，或在 metrics 中区分客户端主动取消与 provider 失败。
+When a stream is dropped by the consumer before a terminal event arrives, `RequestFinished { outcome: Cancelled }` is emitted. This can be disabled with `record_cancellation(false)`, or client-initiated cancellations can be distinguished from provider failures in your metrics.
 
-默认不包含：
+Not included by default:
 
-- session id；
-- SDK request id；
-- profile id 和 capability 快照；
-- prompt / message / reasoning / tool 内容；
-- request/response body。
+- session id;
+- SDK request id;
+- profile id and capability snapshot;
+- prompt / message / reasoning / tool content;
+- request/response bodies.
 
-需要关联 ID 时必须显式打开：
+Correlation IDs must be explicitly opted into:
 
 ```rust
 let config = AuditConfig::enabled()
@@ -968,10 +945,9 @@ let config = AuditConfig::enabled()
     .record_normalization(true);
 ```
 
-session id 默认关闭，因为它可能包含租户或用户上下文。自定义 profile id 也可能
-编码租户信息，因此默认不进入审计。
+The session id is off by default because it may contain tenant or user context. Custom profile ids may also encode tenant information, so they are excluded from audits by default.
 
-生产环境推荐使用非阻塞有界队列：
+For production, a non-blocking bounded queue is recommended:
 
 ```rust
 use mutil_ai::{AuditConfig, TransportConfig, bounded_audit_channel};
@@ -990,13 +966,11 @@ println!(
 );
 ```
 
-队列满时直接丢弃并计数，不会阻塞模型请求。`sample_every(N)` 按整个逻辑请求
-采样，避免只采到 attempt、漏掉最终结果。
+When the queue is full, events are dropped and counted immediately — model requests are never blocked. `sample_every(N)` samples per whole logical request, avoiding samples that capture attempts but miss the final result.
 
-## 10. 显式端点与扩展字段
+## 10. Explicit endpoints and extension fields
 
-同一个厂商可能同时提供 Chat Completions、Responses 和 Anthropic 三种协议。
-base URL 不能唯一决定行为，因此通用 adapter 要求显式传入 `EndpointSpec`：
+A single vendor may simultaneously offer Chat Completions, Responses, and Anthropic protocols. The base URL alone cannot determine behavior, so generic adapters require an explicit `EndpointSpec`:
 
 ```rust
 use mutil_ai::{
@@ -1017,8 +991,7 @@ let model = EndpointAdapter::new("qwen3", endpoint)
     .api_key_from_env("GATEWAY_API_KEY");
 ```
 
-`OpenAICompatible` 保留为 `EndpointAdapter` 的兼容别名；新代码优先使用
-`EndpointAdapter`，因为它同时 dispatch：
+`OpenAICompatible` remains as a compatibility alias for `EndpointAdapter`; new code should prefer `EndpointAdapter`, since it dispatches to all of:
 
 ```text
 OpenAiChat
@@ -1027,10 +1000,9 @@ AnthropicMessages
 GeminiGenerateContent
 ```
 
-协议仍然必须由调用方显式选择，不能靠 URL 猜测。Gemini 的普通与流式路径也由
-`EndpointSpec` 分别描述。
+The protocol must still be chosen explicitly by the caller — never guessed from the URL. Gemini's normal and streaming paths are also described separately by `EndpointSpec`.
 
-内置 preset 只描述行为，不绑定 URL：
+Built-in presets describe behavior only and are not bound to any URL:
 
 ```rust
 ProviderProfile::deepseek_compatible();
@@ -1040,7 +1012,7 @@ ProviderProfile::glm_compatible();
 ProviderProfile::doubao_compatible();
 ```
 
-也可以通过显式 `ProfileId` 查找，仍然不猜 URL：
+You can also look up presets by an explicit `ProfileId` — still no URL guessing:
 
 ```rust
 use mutil_ai::{EndpointSpec, ProfileId, ProfileSelector};
@@ -1049,16 +1021,16 @@ let endpoint = EndpointSpec::openai_chat("https://gateway.example/v1")
     .profile_selector(ProfileSelector::Builtin(ProfileId::from("qwen")));
 ```
 
-未知 ID 会返回 `Unsupported`，不会回退到 URL 猜测。
+An unknown id returns `Unsupported`; it never falls back to URL guessing.
 
-例如 Qwen preset 会把中立配置转换成：
+For example, the Qwen preset converts the neutral configuration into:
 
 ```text
 ReasoningMode::Disabled       -> enable_thinking = false
 ReasoningConfig::budget_tokens -> thinking_budget
 ```
 
-DeepSeek preset 会转换 `thinking.type`，并使用它文档要求的 effort 映射：
+The DeepSeek preset converts `thinking.type` and uses the effort mapping its documentation requires:
 
 ```text
 minimal -> low
@@ -1066,7 +1038,7 @@ medium  -> high
 xhigh   -> high
 ```
 
-模型级差异用 `ModelProfile` 覆盖。SDK 已经提供 Kimi 的两个常见 preset：
+Model-level differences are overridden with `ModelProfile`. The SDK already provides two common Kimi presets:
 
 ```rust
 use mutil_ai::{EndpointAdapter, ModelProfile};
@@ -1080,7 +1052,7 @@ let model = EndpointAdapter::new("kimi-k2.6", endpoint)
     .model_profile(ModelProfile::kimi_k2_6());
 ```
 
-`kimi_k2_6()` 会生成：
+`kimi_k2_6()` generates:
 
 ```json
 {
@@ -1091,17 +1063,17 @@ let model = EndpointAdapter::new("kimi-k2.6", endpoint)
 }
 ```
 
-capability 在发请求前检查：
+Capabilities are checked before the request is sent:
 
 ```rust
 let mut profile = ProviderProfile::qwen_compatible();
 profile.capabilities.multimodal = false;
 ```
 
-此时请求中如果有图片，会返回 `Unsupported`，不会先发一个必然失败的请求。
+At that point, a request containing images returns `Unsupported` instead of first sending a request that is guaranteed to fail.
 
 
-单次请求的 provider 扩展字段：
+Provider extension fields for a single request:
 
 ```rust
 let request = ChatRequest::user("你好")
@@ -1113,16 +1085,11 @@ let options = RequestOptions::new()
     .extra_query("tenant", "team-a");
 ```
 
-合并规则是：profile 默认值先写入，请求级 `extra_body` 后写入，所以同名扩展
-字段由单次请求覆盖。`model`、`messages`、`input`、`stream` 等 canonical
-字段不可覆盖；冲突会在发请求前返回 `ReservedExtraBodyField`，不会静默生成
-一个错误请求。
+The merge rule is: profile defaults are written first, then request-level `extra_body`, so same-named extension fields are overridden by the single request. Canonical fields such as `model`, `messages`, `input`, and `stream` cannot be overridden; conflicts return `ReservedExtraBodyField` before the request is sent, rather than silently producing a broken request.
 
-`EndpointAdapter` 根据 `EndpointSpec.protocol` dispatch 到 Chat、Responses、
-Anthropic 或 Gemini；普通路径和 Gemini 流式路径均显式配置，不会根据 URL 自动
-猜测。
+`EndpointAdapter` dispatches to Chat, Responses, Anthropic, or Gemini based on `EndpointSpec.protocol`; the normal path and Gemini's streaming path are both configured explicitly — never inferred from the URL.
 
-## 11. 代码结构
+## 11. Code structure
 
 ```text
 src/
@@ -1145,20 +1112,17 @@ examples/
   minimal_agent.rs     只使用公开 API 的 Agent runtime 示例
 ```
 
-关键点：**role 转换、工具修复和跨 provider reasoning 清洗只在 `normalize.rs`
-做一次**，adapter 不各写一套补丁。
+Key point: **role conversion, tool repairs, and cross-provider reasoning cleanup happen exactly once, in `normalize.rs`** — adapters do not each maintain their own patch set.
 
-## 12. 当前版本刻意不做的内容
+## 12. What the current version deliberately does not do
 
-这是 v0.2，目前优先把 role、工具配对、retry、SSE、reasoning、统一
-streaming、取消和通用 provider 扩展边界讲清楚，因此暂时不做：
+This is v0.3.0; the current priority is getting roles, tool pairing, retry, SSE, reasoning, unified streaming, cancellation, and the generic provider extension boundary clearly defined. For now, the following are out of scope:
 
 - WebSocket / Realtime
-- OpenAI Responses 的 `previous_response_id` / `store`
+- OpenAI Responses' `previous_response_id` / `store`
 - Anthropic `cache_control`
 - Gemini Interactions API
 - embedding / rerank / speech
-- 自动把不同 provider 的 reasoning 互译；当前选择安全丢弃，而不是猜测
+- Automatically translating reasoning between different providers; the current choice is to safely drop it rather than guess
 
-这些以后都可以加，但应该加在明确的位置，而不是把 provider 特例塞进下游
-runtime 或示例 Agent 循环。
+All of these can be added later — but they should be added in clearly defined places, not by stuffing provider special cases into the downstream runtime or the example Agent loop.

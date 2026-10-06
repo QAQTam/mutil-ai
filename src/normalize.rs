@@ -4,13 +4,19 @@ use crate::types::{ChatRequest, Message, Part, ProviderStateFormat, Role, ToolRe
 /// The provider-facing protocol we are preparing a request for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
+    /// The OpenAI Chat Completions API.
     OpenAiChat,
+    /// The OpenAI Responses API.
     OpenAiResponses,
+    /// The Anthropic Messages API.
     AnthropicMessages,
+    /// The Google Gemini `generateContent` API.
     GeminiGenerateContent,
 }
 
 impl Protocol {
+    /// The provider state format used to tag reasoning and other opaque
+    /// state carried by this protocol.
     pub fn provider_state_format(self) -> ProviderStateFormat {
         match self {
             Self::OpenAiChat => ProviderStateFormat::OpenAiChat,
@@ -62,7 +68,11 @@ pub struct NormalizeOptions {
     pub developer_to_system: bool,
     /// Unknown/custom roles are downgraded to `User` by default.
     pub custom_to_user: bool,
+    /// Policy for tool results that reference no pending assistant tool
+    /// call. See [`OrphanToolResultPolicy`] for the available choices.
     pub orphan_tool_result: OrphanToolResultPolicy,
+    /// Policy for assistant tool calls that never received a tool result.
+    /// See [`MissingToolResultPolicy`] for the available choices.
     pub missing_tool_result: MissingToolResultPolicy,
     /// Anthropic and Gemini require user/model turns to alternate. OpenAI does
     /// not require this, so its adapter keeps the original message boundaries.
@@ -75,6 +85,11 @@ pub struct NormalizeOptions {
 }
 
 impl NormalizeOptions {
+    /// Build options with sensible defaults for `protocol`.
+    ///
+    /// Role downgrades, orphan-result dropping, and missing-result
+    /// synthesis are enabled; strict same-role merging is enabled only for
+    /// protocols that require alternating turns (Anthropic and Gemini).
     pub fn for_protocol(protocol: Protocol) -> Self {
         let merge_adjacent_same_role = matches!(
             protocol,
@@ -96,7 +111,9 @@ impl NormalizeOptions {
 /// A provider-facing message after role downgrade and tool-pair repair.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NormalizedMessage {
+    /// The downgraded role, safe to send to a provider adapter.
     pub role: ExternalRole,
+    /// Content parts belonging to this message, already repaired.
     pub parts: Vec<Part>,
 }
 
@@ -107,56 +124,98 @@ pub struct NormalizedChat {
     /// outside the normal message list. OpenAI Chat can prepend this as a
     /// system message.
     pub system: Option<String>,
+    /// Every normalized message, in order.
     pub messages: Vec<NormalizedMessage>,
+    /// Tool specifications passed through from the request unchanged.
     pub tools: Vec<ToolSpec>,
 }
 
 /// A human-readable trace of every repair made at the boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NormalizeAction {
+    /// A `Developer` role message was downgraded to `System` or `User`.
     DowngradedDeveloper,
+    /// A custom role was downgraded to a provider-safe role.
     DowngradedCustomRole {
+        /// The original custom role name.
         role: String,
     },
+    /// A tool call arrived without an id and was assigned a generated one.
     AssignedToolCallId {
+        /// Name of the tool being called.
         name: String,
+        /// The generated call id.
         id: String,
     },
+    /// A tool result was missing a call id, which was filled in from the
+    /// matching pending tool call.
     FilledToolResultId {
+        /// Name of the tool the result belongs to.
         name: String,
+        /// The call id assigned to the result.
         id: String,
     },
+    /// A tool result had no matching assistant tool call and was handled
+    /// according to [`OrphanToolResultPolicy`] (dropped or downgraded).
     DroppedOrphanToolResult {
+        /// Name of the tool the orphaned result belonged to.
         name: String,
     },
+    /// An assistant tool call never received a result, so an error result
+    /// was synthesized per [`MissingToolResultPolicy::Synthesize`].
     SynthesizedMissingToolResult {
+        /// Id of the unpaired tool call.
         call_id: String,
+        /// Name of the tool being called.
         name: String,
     },
+    /// An assistant tool call never received a result, so the call itself
+    /// was removed per [`MissingToolResultPolicy::DropToolCall`].
     DroppedUnpairedToolCall {
+        /// Id of the removed tool call.
         call_id: String,
+        /// Name of the tool being called.
         name: String,
     },
+    /// Reasoning state produced by a different protocol was dropped. See
+    /// [`NormalizeOptions::preserve_foreign_reasoning`].
     DroppedForeignReasoning {
+        /// Format of the state that was dropped.
         format: ProviderStateFormat,
+        /// Format expected by the target protocol.
         expected: ProviderStateFormat,
     },
+    /// A tool call carrying provider state from a different protocol had
+    /// that state cleared.
     DroppedForeignToolState {
+        /// Format of the state that was dropped.
         format: ProviderStateFormat,
+        /// Format expected by the target protocol.
         expected: ProviderStateFormat,
     },
+    /// A text part carrying provider state from a different protocol had
+    /// that state cleared.
     DroppedForeignTextState {
+        /// Format of the state that was dropped.
         format: ProviderStateFormat,
+        /// Format expected by the target protocol.
         expected: ProviderStateFormat,
     },
+    /// A provider-specific item from a different protocol was dropped.
     DroppedForeignProviderItem {
+        /// Format of the item that was dropped.
         format: ProviderStateFormat,
+        /// Format expected by the target protocol.
         expected: ProviderStateFormat,
     },
+    /// Reasoning was dropped because only assistant messages may carry it.
     DroppedReasoningFromNonAssistant {
+        /// The role of the message that contained the reasoning.
         role: ExternalRole,
     },
+    /// Two adjacent messages with the same role were merged into one.
     MergedAdjacent {
+        /// The role of the merged messages.
         role: ExternalRole,
     },
 }
@@ -164,10 +223,12 @@ pub enum NormalizeAction {
 /// Details about normalization. Callers can log this while learning.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NormalizeReport {
+    /// Every repair action recorded during normalization, in order.
     pub actions: Vec<NormalizeAction>,
 }
 
 impl NormalizeReport {
+    /// Returns `true` when normalization made no repairs.
     pub fn is_clean(&self) -> bool {
         self.actions.is_empty()
     }
@@ -222,23 +283,38 @@ impl NormalizeReport {
 /// Context-free aggregate of normalization repairs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NormalizeStats {
+    /// Total number of repairs recorded.
     pub total: u32,
+    /// Number of `Developer` roles downgraded.
     pub downgraded_developer: u32,
+    /// Number of custom roles downgraded.
     pub downgraded_custom_role: u32,
+    /// Number of tool call ids that were generated.
     pub assigned_tool_call_id: u32,
+    /// Number of tool results that had a missing call id filled in.
     pub filled_tool_result_id: u32,
+    /// Number of orphan tool results dropped.
     pub dropped_orphan_tool_result: u32,
+    /// Number of missing tool results that were synthesized.
     pub synthesized_missing_tool_result: u32,
+    /// Number of unpaired tool calls dropped.
     pub dropped_unpaired_tool_call: u32,
+    /// Number of reasoning parts with foreign provider state dropped.
     pub dropped_foreign_reasoning: u32,
+    /// Number of tool calls whose foreign provider state was cleared.
     pub dropped_foreign_tool_state: u32,
+    /// Number of text parts whose foreign provider state was cleared.
     pub dropped_foreign_text_state: u32,
+    /// Number of provider items from a foreign protocol dropped.
     pub dropped_foreign_provider_item: u32,
+    /// Number of reasoning parts dropped from non-assistant messages.
     pub dropped_reasoning_from_non_assistant: u32,
+    /// Number of adjacent same-role message merges performed.
     pub merged_adjacent: u32,
 }
 
 impl NormalizeStats {
+    /// Returns `true` when no repairs were recorded.
     pub const fn is_clean(self) -> bool {
         self.total == 0
     }
@@ -253,6 +329,12 @@ struct PendingCall {
 }
 
 /// Normalize a request using the default rules for a protocol.
+///
+/// # Errors
+///
+/// Returns an error if the [`OrphanToolResultPolicy::Error`] or
+/// [`MissingToolResultPolicy::Error`] policy is triggered. The default
+/// rules never do, so this cannot fail in practice.
 pub fn normalize(
     request: &ChatRequest,
     protocol: Protocol,
@@ -265,6 +347,12 @@ pub fn normalize(
 /// The output is intentionally boring: only `System`, `User`, `Assistant` and
 /// `Tool` can reach an adapter, and every `ToolCall` is paired with a
 /// `ToolResult`.
+///
+/// # Errors
+///
+/// Returns an error if [`NormalizeOptions::orphan_tool_result`] or
+/// [`NormalizeOptions::missing_tool_result`] is set to an `Error` policy
+/// and the corresponding malformed history is encountered.
 pub fn normalize_with_options(
     request: &ChatRequest,
     options: NormalizeOptions,

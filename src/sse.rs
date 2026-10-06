@@ -10,18 +10,24 @@ const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 /// A parsed SSE message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseMessage {
+    /// The `event` field, or `None` when the event used the default type.
     pub event: Option<String>,
+    /// The `data` field, with multiple data lines joined by `\n`.
     pub data: String,
+    /// The most recent `id` field seen before this message.
     pub id: Option<String>,
 }
 
 /// An event emitted by [`SseParser`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SseEvent {
+    /// A complete SSE message, dispatched on a blank line.
     Message(SseMessage),
+    /// A server-directed `retry` reconnection delay.
     Retry(Duration),
 }
 
+/// How invalid UTF-8 in field values is handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SseUtf8Policy {
     /// WHATWG EventSource behavior: invalid UTF-8 becomes U+FFFD.
@@ -30,14 +36,18 @@ pub enum SseUtf8Policy {
     Strict,
 }
 
+/// Errors that can occur while parsing an SSE stream.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SseError {
+    /// Invalid UTF-8 was encountered under [`SseUtf8Policy::Strict`].
     #[error("invalid UTF-8 in an SSE field (strict mode)")]
     Utf8,
 
+    /// A single line exceeded the configured byte limit.
     #[error("SSE line exceeded {limit} bytes")]
     LineTooLong { limit: usize },
 
+    /// A single event exceeded the configured byte limit.
     #[error("SSE event exceeded {limit} bytes")]
     EventTooLarge { limit: usize },
 }
@@ -71,6 +81,8 @@ impl Default for SseParser {
 }
 
 impl SseParser {
+    /// Creates a parser with default limits: 64 KiB per line and 1 MiB per
+    /// event, using [`SseUtf8Policy::Replace`].
     pub fn new() -> Self {
         Self::with_limits(DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_EVENT_BYTES)
     }
@@ -80,6 +92,9 @@ impl SseParser {
         Self::new().with_utf8_policy(SseUtf8Policy::Strict)
     }
 
+    /// Creates a parser with the given per-line and per-event byte limits.
+    ///
+    /// A limit of `0` rejects any non-empty line or data field.
     pub fn with_limits(max_line_bytes: usize, max_event_bytes: usize) -> Self {
         Self {
             line: Vec::with_capacity(256),
@@ -97,6 +112,7 @@ impl SseParser {
         }
     }
 
+    /// Sets how invalid UTF-8 in field values is handled.
     pub fn with_utf8_policy(mut self, utf8_policy: SseUtf8Policy) -> Self {
         self.utf8_policy = utf8_policy;
         self
@@ -109,14 +125,18 @@ impl SseParser {
         self
     }
 
+    /// Returns the last event id seen on this connection, if any.
     pub fn last_event_id(&self) -> Option<&str> {
         self.last_event_id.as_deref()
     }
 
+    /// Returns the reconnect delay most recently requested by a `retry` field.
     pub fn retry(&self) -> Option<Duration> {
         self.retry
     }
 
+    /// Clears all state, including [`last_event_id`](Self::last_event_id) and
+    /// [`retry`](Self::retry).
     pub fn reset(&mut self) {
         self.clear_pending();
         self.last_event_id = None;

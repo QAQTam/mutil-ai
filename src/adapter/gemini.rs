@@ -43,6 +43,7 @@ pub struct GeminiGenerateContent {
 }
 
 impl GeminiGenerateContent {
+    /// Create an adapter for the given Gemini model.
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
@@ -54,21 +55,26 @@ impl GeminiGenerateContent {
         }
     }
 
+    /// Set an explicit API key, taking precedence over `GEMINI_API_KEY`.
     pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
         self
     }
 
+    /// Override the default base URL
+    /// (`https://generativelanguage.googleapis.com/v1beta`).
     pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
 
+    /// Override the retry policy used for failed requests.
     pub fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
         self
     }
 
+    /// Configure transport-level settings (timeouts, proxies, audit hooks).
     pub fn transport(mut self, transport: TransportConfig) -> Self {
         self.transport = transport;
         self

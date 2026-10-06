@@ -5,34 +5,57 @@ use thiserror::Error;
 
 use crate::retry::RetrySource;
 
+/// Convenience alias for results returned by this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Stable high-level classification for SDK errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
+    /// No API key was configured, or the provider rejected it (HTTP 401).
     Authentication,
+    /// The credentials are valid but lack access to the resource (HTTP 403).
     PermissionDenied,
+    /// The requested resource does not exist (HTTP 404).
     NotFound,
+    /// The provider rejected the request as malformed (HTTP 400-class).
     InvalidRequest,
+    /// The prompt or output exceeds the model's context window.
     ContextLengthExceeded,
+    /// The request or output was blocked by a safety or content policy.
     ContentFiltered,
+    /// The provider is rate limiting the account (HTTP 429).
     RateLimited,
+    /// The provider is temporarily overloaded (e.g. HTTP 425 or 529).
     Overloaded,
+    /// The request timed out.
     Timeout,
+    /// A network-level failure prevented reaching the provider.
     Connection,
+    /// The request was cancelled by the caller.
     Cancelled,
+    /// A response body could not be decoded.
     Decode,
+    /// The provider emitted a malformed or unexpected stream event.
     StreamProtocol,
+    /// The provider itself reported an internal error (HTTP 5xx).
     ProviderInternal,
+    /// The selected provider does not support the requested operation.
     Unsupported,
+    /// The SDK or provider client was misconfigured.
     Configuration,
+    /// Request normalization failed.
     Normalization,
+    /// A tool invocation failed or referenced an unknown tool.
     Tool,
+    /// The agent loop exhausted its step budget.
     MaxSteps,
+    /// The error could not be classified.
     Unknown,
 }
 
 impl ErrorKind {
+    /// Stable snake_case identifier for this kind, suitable for logs and
+    /// metrics.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Authentication => "authentication",
@@ -58,6 +81,7 @@ impl ErrorKind {
         }
     }
 
+    /// Whether errors of this kind are normally safe to retry.
     pub const fn is_retryable(self) -> bool {
         matches!(
             self,
@@ -88,33 +112,50 @@ pub struct ProviderErrorInfo {
     pub details_count: usize,
 }
 
+/// The error type returned by this crate's public API.
+///
+/// Its [`Display`](std::fmt::Display) output is safe to log: the `Api`
+/// variant never embeds the raw provider response body, and the `Debug`
+/// output redacts it. Use [`Error::kind`] for stable classification and
+/// [`Error::raw_body`] when you explicitly need the provider body.
 #[derive(Error)]
 pub enum Error {
+    /// No API key was configured for the provider.
     #[error("missing API key: {0}")]
     MissingApiKey(String),
 
+    /// The HTTP request to the provider failed at the transport level.
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// The request was cancelled before it completed.
     #[error("request cancelled")]
     Cancelled,
 
+    /// The request exceeded its configured timeout.
     #[error("request timed out: {0}")]
     Timeout(String),
 
+    /// A response body was not valid JSON.
     #[error("invalid JSON: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// The provider's stream emitted a malformed or unexpected event.
     #[error("stream protocol error: {0}")]
     StreamProtocol(String),
 
+    /// The provider reported an error inside a stream.
     #[error("provider stream error: {0}")]
     ProviderStream(String),
 
     #[error("{provider} returned HTTP {status}")]
     Api {
+        /// The provider identifier, such as `openai`.
         provider: &'static str,
+        /// HTTP status code returned by the provider.
         status: u16,
+        /// Raw response body. Excluded from log-safe output; see
+        /// [`Error::raw_body`].
         body: String,
         /// Parsed server-directed retry delay, when present.
         retry_after: Option<Duration>,
@@ -124,57 +165,85 @@ pub enum Error {
         request_id: Option<String>,
     },
 
+    /// A provider was configured without a model.
     #[error("provider `{0}` is not configured with a model")]
     MissingModel(&'static str),
 
+    /// The request could not be built as specified.
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
+    /// The selected provider does not support the requested operation.
     #[error("unsupported operation: {0}")]
     Unsupported(String),
 
+    /// The model requested a tool that was never registered.
     #[error("tool `{0}` was requested by the model but is not registered")]
     ToolNotFound(String),
 
+    /// A registered tool returned an error while executing.
     #[error("tool `{tool}` failed: {message}")]
-    ToolFailed { tool: String, message: String },
+    ToolFailed {
+        /// Name of the tool that failed.
+        tool: String,
+        /// Error message reported by the tool.
+        message: String,
+    },
 
+    /// The agent loop exceeded its configured step budget.
     #[error("agent exceeded max_steps={0}")]
     MaxSteps(usize),
 
+    /// A request could not be normalized for the target protocol.
     #[error("normalization error: {0}")]
     Normalize(String),
 
+    /// A retry policy configuration was invalid.
     #[error("invalid retry policy: {0}")]
     InvalidRetryPolicy(String),
 
+    /// An HTTP header value was invalid.
     #[error("invalid HTTP header value: {0}")]
     HeaderValue(#[from] reqwest::header::InvalidHeaderValue),
 
+    /// An HTTP header name was invalid.
     #[error("invalid HTTP header name: {0}")]
     HeaderName(#[from] reqwest::header::InvalidHeaderName),
 
+    /// An attempt was made to override a header the SDK manages itself.
     #[error("protected HTTP header cannot be overridden: {0}")]
     ProtectedHeader(String),
 
+    /// A header value contained non-ASCII characters.
     #[error("HTTP header `{name}` must be ASCII for interoperability")]
-    NonAsciiHeaderValue { name: String },
+    NonAsciiHeaderValue {
+        /// Name of the offending header.
+        name: String,
+    },
 
+    /// An extra body field collided with a canonical SDK field.
     #[error("{protocol} extra body field `{field}` cannot override a canonical SDK field")]
     ReservedExtraBodyField {
+        /// The provider protocol that rejected the field.
         protocol: &'static str,
+        /// The reserved field name.
         field: String,
     },
 
+    /// An extra query parameter collided with an endpoint-reserved name.
     #[error("{protocol} extra query parameter `{parameter}` is reserved by the endpoint")]
     ReservedExtraQuery {
+        /// The provider protocol that rejected the parameter.
         protocol: &'static str,
+        /// The reserved parameter name.
         parameter: String,
     },
 
+    /// A base URL or endpoint could not be parsed.
     #[error("invalid endpoint: {0}")]
     InvalidEndpoint(String),
 
+    /// A provider profile configuration was invalid.
     #[error("invalid provider profile: {0}")]
     InvalidProfile(String),
 }
@@ -279,6 +348,7 @@ impl fmt::Debug for Error {
 }
 
 impl Error {
+    /// Classify this error into a stable, provider-neutral [`ErrorKind`].
     pub fn kind(&self) -> ErrorKind {
         match self {
             Self::MissingApiKey(_) => ErrorKind::Authentication,

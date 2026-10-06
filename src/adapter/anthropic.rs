@@ -28,6 +28,8 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 /// Entry point for Anthropic adapters.
+///
+/// See [`Anthropic::messages`] to construct an [`AnthropicMessages`] adapter.
 pub struct Anthropic;
 
 impl Anthropic {
@@ -48,6 +50,7 @@ pub struct AnthropicMessages {
 }
 
 impl AnthropicMessages {
+    /// Create an adapter for the given Anthropic model.
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
@@ -59,21 +62,26 @@ impl AnthropicMessages {
         }
     }
 
+    /// Set an explicit API key, taking precedence over `ANTHROPIC_API_KEY`.
     pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
         self
     }
 
+    /// Override the default base URL (`https://api.anthropic.com/v1`),
+    /// e.g. for gateways or self-hosted proxies speaking the same protocol.
     pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
 
+    /// Override the retry policy used for failed requests.
     pub fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
         self
     }
 
+    /// Configure transport-level settings (timeouts, proxies, audit hooks).
     pub fn transport(mut self, transport: TransportConfig) -> Self {
         self.transport = transport;
         self

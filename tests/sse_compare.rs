@@ -1,4 +1,6 @@
+#[cfg(target_os = "linux")]
 use std::hint::black_box;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -69,6 +71,7 @@ fn hand_written_matches_sse_stream_for_message_events() {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn cpu_time() -> Duration {
     let stat = std::fs::read_to_string("/proc/self/stat").expect("read /proc/self/stat");
     let end_comm = stat.rfind(')').expect("stat has comm");
@@ -83,6 +86,7 @@ fn cpu_time() -> Duration {
     Duration::from_secs_f64((utime + stime) as f64 / hz)
 }
 
+#[cfg(target_os = "linux")]
 fn build_token_chunks(token_count: usize, events_per_chunk: usize) -> Vec<Bytes> {
     const EVENT: &str = "data: {\"content\":\"tok\"}\n\n";
     let mut chunks = Vec::with_capacity(token_count.div_ceil(events_per_chunk));
@@ -101,6 +105,7 @@ fn build_token_chunks(token_count: usize, events_per_chunk: usize) -> Vec<Bytes>
     chunks
 }
 
+#[cfg(target_os = "linux")]
 fn run_ours(chunks: &[Bytes]) -> (Duration, usize) {
     let start_cpu = cpu_time();
     let start_wall = Instant::now();
@@ -124,6 +129,7 @@ fn run_ours(chunks: &[Bytes]) -> (Duration, usize) {
     (elapsed_cpu, events)
 }
 
+#[cfg(target_os = "linux")]
 fn run_sse_stream(runtime: &tokio::runtime::Runtime, chunks: &[Bytes]) -> (Duration, usize) {
     let start_cpu = cpu_time();
     let start_wall = Instant::now();
@@ -146,6 +152,7 @@ fn run_sse_stream(runtime: &tokio::runtime::Runtime, chunks: &[Bytes]) -> (Durat
     (elapsed_cpu, events)
 }
 
+#[cfg(target_os = "linux")]
 fn coefficient_of_variation(samples: &[Duration]) -> f64 {
     let mean = samples.iter().map(Duration::as_secs_f64).sum::<f64>() / samples.len() as f64;
     if mean == 0.0 {
@@ -162,6 +169,7 @@ fn coefficient_of_variation(samples: &[Duration]) -> f64 {
     variance.sqrt() / mean
 }
 
+#[cfg(target_os = "linux")]
 fn report(label: &str, samples: &[Duration], events: usize) {
     let mean = samples.iter().map(Duration::as_secs_f64).sum::<f64>() / samples.len() as f64;
     let min = samples.iter().min().copied().unwrap_or_default();
@@ -171,6 +179,7 @@ fn report(label: &str, samples: &[Duration], events: usize) {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 #[ignore = "performance comparison; run with --ignored --nocapture"]
 fn compare_10k_tokens_per_second_cpu() {
     const TOKENS: usize = 200_000; // 20 seconds at 10,000 tok/s

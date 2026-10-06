@@ -16,18 +16,35 @@ use crate::types::Usage;
 /// and profile metadata require explicit opt-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditConfig {
+    /// Master switch: when `false`, no audit events are emitted.
     pub enabled: bool,
+    /// Emit [`AuditEvent::AttemptStarted`] and [`AuditEvent::AttemptFinished`].
     pub record_attempts: bool,
+    /// Emit retry and stream-reconnect scheduling events.
     pub record_retries: bool,
+    /// Emit success outcomes for attempts and requests.
     pub record_success: bool,
+    /// Emit failure outcomes for attempts and requests.
     pub record_failure: bool,
+    /// Emit a final [`AuditEvent::RequestFinished`] with outcome
+    /// [`AuditOutcome::Cancelled`] when a stream is dropped before completion.
     pub record_cancellation: bool,
+    /// Emit response-header and first-token timing events.
     pub record_timing: bool,
+    /// Emit context-free aggregate counts for normalization repairs.
     pub record_normalization: bool,
+    /// Include the profile snapshot in [`AuditEvent::RequestStarted`].
     pub include_profile: bool,
+    /// Include the caller-supplied SDK request id in
+    /// [`AuditEvent::RequestStarted`].
     pub include_sdk_request_id: bool,
+    /// Include the provider's request id in header, attempt, and completion
+    /// events.
     pub include_provider_request_id: bool,
+    /// Include the session id in [`AuditEvent::RequestStarted`]. Off by
+    /// default because session ids can be tenant-sensitive.
     pub include_session_id: bool,
+    /// Include token usage in [`AuditEvent::RequestFinished`].
     pub include_usage: bool,
     /// Sample one out of every N logical requests. `1` records every request.
     pub sample_every: u64,
@@ -55,6 +72,7 @@ impl Default for AuditConfig {
 }
 
 impl AuditConfig {
+    /// Creates a config with auditing enabled and all other defaults kept.
     pub fn enabled() -> Self {
         Self {
             enabled: true,
@@ -62,21 +80,25 @@ impl AuditConfig {
         }
     }
 
+    /// Sets whether attempt-level events are emitted.
     pub fn record_attempts(mut self, enabled: bool) -> Self {
         self.record_attempts = enabled;
         self
     }
 
+    /// Sets whether retry and reconnect scheduling events are emitted.
     pub fn record_retries(mut self, enabled: bool) -> Self {
         self.record_retries = enabled;
         self
     }
 
+    /// Sets whether success outcomes are emitted.
     pub fn record_success(mut self, enabled: bool) -> Self {
         self.record_success = enabled;
         self
     }
 
+    /// Sets whether failure outcomes are emitted.
     pub fn record_failure(mut self, enabled: bool) -> Self {
         self.record_failure = enabled;
         self
@@ -107,11 +129,14 @@ impl AuditConfig {
         self
     }
 
+    /// Sets whether the SDK request id is included in
+    /// [`AuditEvent::RequestStarted`].
     pub fn include_sdk_request_id(mut self, enabled: bool) -> Self {
         self.include_sdk_request_id = enabled;
         self
     }
 
+    /// Sets whether the provider request id is included in events.
     pub fn include_provider_request_id(mut self, enabled: bool) -> Self {
         self.include_provider_request_id = enabled;
         self
@@ -123,29 +148,39 @@ impl AuditConfig {
         self
     }
 
+    /// Sets whether token usage is included in
+    /// [`AuditEvent::RequestFinished`].
     pub fn include_usage(mut self, enabled: bool) -> Self {
         self.include_usage = enabled;
         self
     }
 
+    /// Sets the sampling rate; values below `1` are clamped to `1`.
     pub fn sample_every(mut self, sample_every: u64) -> Self {
         self.sample_every = sample_every.max(1);
         self
     }
 }
 
+/// The final outcome of an attempt or request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditOutcome {
+    /// The operation completed without error.
     Success,
+    /// The operation ended with an error.
     Failure,
+    /// The operation was cancelled (including drop-before-completion).
     Cancelled,
 }
 
 /// Which model output started the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirstTokenKind {
+    /// The first token was assistant-visible text.
     Text,
+    /// The first token was reasoning output.
     Reasoning,
+    /// The first token was tool-call data.
     ToolCall,
 }
 
@@ -156,7 +191,11 @@ pub enum FirstTokenKind {
 /// size across retries and stream reconnects, including provider error bodies.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ByteCounts {
+    /// Serialized request body size for one HTTP attempt; retries reuse the
+    /// same logical body.
     pub request_body: u64,
+    /// Cumulative decoded response body size across retries and stream
+    /// reconnects, including provider error bodies.
     pub response_body: u64,
 }
 
@@ -166,8 +205,12 @@ pub struct ByteCounts {
 /// `time_to_first_token` is only available for streaming model output.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RequestTiming {
+    /// Time from request start until HTTP response headers arrived.
     pub time_to_headers: Option<Duration>,
+    /// Time from request start until the first streamed token; `None` for
+    /// non-streaming requests.
     pub time_to_first_token: Option<Duration>,
+    /// The kind of output that produced the first token.
     pub first_token_kind: Option<FirstTokenKind>,
 }
 
@@ -185,51 +228,91 @@ pub struct ProfileAuditSnapshot {
 /// A structured, context-free audit event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditEvent {
+    /// A logical request (including all retries) began.
     RequestStarted {
+        /// Provider identifier, e.g. `"openai"`.
         provider: &'static str,
+        /// Wire protocol identifier, e.g. `"chat-completions"`.
         protocol: &'static str,
+        /// Model name requested.
         model: String,
+        /// Caller-supplied SDK request id, when opted in.
         sdk_request_id: Option<String>,
+        /// Session id, when opted in.
         session_id: Option<String>,
+        /// Profile snapshot, when opted in.
         profile: Option<ProfileAuditSnapshot>,
     },
+    /// One HTTP attempt began.
     AttemptStarted {
+        /// Attempt number, as tracked by the SDK.
         attempt: u32,
     },
+    /// HTTP response headers arrived for an attempt.
     ResponseHeaders {
+        /// Attempt this response belongs to.
         attempt: u32,
+        /// Time from the start of that attempt until headers arrived.
         elapsed: Duration,
+        /// HTTP status code.
         status: u16,
+        /// Provider request id, when opted in.
         provider_request_id: Option<String>,
     },
+    /// One HTTP attempt ended.
     AttemptFinished {
+        /// Attempt that finished.
         attempt: u32,
+        /// Duration of the attempt.
         duration: Duration,
+        /// Whether the attempt succeeded or failed.
         outcome: AuditOutcome,
+        /// HTTP status code, when a response was received.
         status: Option<u16>,
+        /// Error classification, when the attempt failed.
         error_kind: Option<ErrorKind>,
+        /// Whether the SDK considers the error retryable.
         retryable: bool,
+        /// Provider request id, when opted in.
         provider_request_id: Option<String>,
     },
+    /// The first streamed token arrived.
     FirstToken {
+        /// Time from the start of the logical request.
         elapsed: Duration,
+        /// Which kind of output produced the token.
         kind: FirstTokenKind,
     },
+    /// A response body required normalization; only aggregate counts are
+    /// reported, never content.
     Normalization {
+        /// Context-free repair counters.
         stats: NormalizeStats,
     },
+    /// A caller-requested response transform was applied.
     TransformApplied,
+    /// A retry of the request was scheduled.
     RetryScheduled {
+        /// Attempt that failed.
         attempt: u32,
+        /// Attempt number that will run next.
         next_attempt: u32,
+        /// Delay before the next attempt.
         delay: Duration,
+        /// Classification of the error that triggered the retry.
         error_kind: Option<ErrorKind>,
     },
+    /// A reconnect of an in-progress SSE stream was scheduled.
     StreamReconnectScheduled {
+        /// Reconnect attempt number, starting at 1.
         attempt: u32,
+        /// Delay before reconnecting.
         delay: Duration,
+        /// Whether a last event id is available to resume from.
         has_last_event_id: bool,
     },
+    /// The logical request (including retries) ended. Emitted exactly once
+    /// per request.
     RequestFinished {
         outcome: AuditOutcome,
         duration: Duration,
@@ -244,6 +327,9 @@ pub enum AuditEvent {
 
 /// Receives context-free audit events.
 pub trait AuditSink: Send + Sync {
+    /// Handles one audit event. Implementations should be non-blocking; use
+    /// [`bounded_audit_channel`] for a queue that never backpressures the
+    /// request path.
     fn record(&self, event: AuditEvent);
 }
 
@@ -256,6 +342,7 @@ pub struct AuditStats {
 }
 
 impl AuditStats {
+    /// Loads the current counters as a plain snapshot.
     pub fn snapshot(&self) -> AuditStatsSnapshot {
         AuditStatsSnapshot {
             accepted: self.accepted.load(Ordering::Relaxed),
@@ -265,14 +352,19 @@ impl AuditStats {
     }
 }
 
+/// A point-in-time copy of [`AuditStats`] counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AuditStatsSnapshot {
+    /// Events successfully delivered to the channel.
     pub accepted: u64,
+    /// Events dropped because the channel was full.
     pub dropped_full: u64,
+    /// Events dropped because the receiver was disconnected.
     pub dropped_disconnected: u64,
 }
 
 impl AuditStatsSnapshot {
+    /// Total number of dropped events.
     pub const fn dropped(&self) -> u64 {
         self.dropped_full + self.dropped_disconnected
     }

@@ -19,7 +19,10 @@ pub type ModelStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send + '
 /// Opt-in transport reconnect policy for an already-started SSE stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamReconnectPolicy {
+    /// Maximum number of reconnect attempts before the stream fails.
     pub max_attempts: u32,
+    /// Delay between attempts, used when neither the server nor the parser
+    /// supplied a `retry` hint.
     pub delay: Duration,
     /// Refuse reconnect when no SSE event id has been observed.
     pub require_event_id: bool,
@@ -36,20 +39,25 @@ impl Default for StreamReconnectPolicy {
 }
 
 impl StreamReconnectPolicy {
+    /// Creates the default policy: 2 attempts, 250 ms delay, requiring an
+    /// event id.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Sets the maximum number of reconnect attempts.
     pub fn max_attempts(mut self, max_attempts: u32) -> Self {
         self.max_attempts = max_attempts;
         self
     }
 
+    /// Sets the delay between reconnect attempts.
     pub fn delay(mut self, delay: Duration) -> Self {
         self.delay = delay;
         self
     }
 
+    /// Sets whether reconnecting requires an observed SSE event id.
     pub fn require_event_id(mut self, require_event_id: bool) -> Self {
         self.require_event_id = require_event_id;
         self
@@ -117,8 +125,11 @@ pub enum StreamEvent {
 /// Stable, content-free metadata for a recoverable stream error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamError {
+    /// The error classification, safe to match on.
     pub kind: ErrorKind,
+    /// A human-readable description without request content.
     pub message: String,
+    /// Whether the SDK or caller may retry the request.
     pub recoverable: bool,
 }
 

@@ -41,14 +41,35 @@ pub use openai_responses::OpenAIResponses;
 /// 3. mapping the provider response back to [`crate::ChatResponse`].
 #[async_trait]
 pub trait ModelAdapter: Send + Sync {
+    /// Stable identifier of the provider behind this adapter,
+    /// e.g. `"anthropic-messages"`.
     fn provider_name(&self) -> &'static str;
+
+    /// Model identifier used for this adapter, e.g. `"claude-sonnet-4"`.
     fn model_name(&self) -> &str;
 
+    /// Complete a request with default [`RequestOptions`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be normalized, the provider
+    /// rejects it, or the response fails to parse.
     async fn complete(&self, request: &ChatRequest) -> Result<crate::ChatResponse> {
         let options = RequestOptions::default();
         self.complete_with(request, &options).await
     }
 
+    /// Complete a request with explicit [`RequestOptions`].
+    ///
+    /// This is the primary entry point for non-streaming inference: the
+    /// adapter normalizes the [`ChatRequest`], serializes it to the provider
+    /// wire format, sends it, and parses the response back into
+    /// [`crate::ChatResponse`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be normalized or validated,
+    /// the provider returns an error status, or the response fails to parse.
     async fn complete_with(
         &self,
         request: &ChatRequest,

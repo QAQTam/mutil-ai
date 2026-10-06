@@ -44,30 +44,46 @@ pub fn parse_retry_after_at(value: &str, now: SystemTime) -> Option<Duration> {
 /// Provider family used to decide which vendor-specific reset headers to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryProvider {
+    /// Read only standard headers (`retry-after-ms`, `retry-after`).
     Generic,
+    /// Additionally read OpenAI `x-ratelimit-reset-*` headers.
     OpenAi,
+    /// Additionally read Anthropic `anthropic-ratelimit-*-reset` headers.
     Anthropic,
+    /// Google-style provider; no vendor-specific headers are read yet.
     Google,
 }
 
 /// Where a retry delay came from. This is useful for logs and debugging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetrySource {
+    /// Non-standard `retry-after-ms` header, in milliseconds.
     RetryAfterMs,
+    /// Standard `retry-after` header, in (possibly fractional) seconds.
     RetryAfterSeconds,
+    /// Standard `retry-after` header, as an HTTP-date.
     RetryAfterDate,
+    /// OpenAI `x-ratelimit-reset-requests`, in Go duration format.
     OpenAiResetRequests,
+    /// OpenAI `x-ratelimit-reset-tokens`, in Go duration format.
     OpenAiResetTokens,
+    /// Anthropic `anthropic-ratelimit-requests-reset`, as an RFC 3339 date.
     AnthropicResetRequests,
+    /// Anthropic `anthropic-ratelimit-tokens-reset`, as an RFC 3339 date.
     AnthropicResetTokens,
+    /// Anthropic `anthropic-ratelimit-input-tokens-reset`, as an RFC 3339 date.
     AnthropicResetInputTokens,
+    /// Anthropic `anthropic-ratelimit-output-tokens-reset`, as an RFC 3339 date.
     AnthropicResetOutputTokens,
 }
 
 /// A parsed server-directed retry instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryDirective {
+    /// How long to wait before the next attempt. A past reset date yields
+    /// [`Duration::ZERO`].
     pub delay: Duration,
+    /// Which header the delay was parsed from.
     pub source: RetrySource,
 }
 
@@ -81,6 +97,10 @@ const ANTHROPIC_RESET_INPUT_TOKENS: &str = "anthropic-ratelimit-input-tokens-res
 const ANTHROPIC_RESET_OUTPUT_TOKENS: &str = "anthropic-ratelimit-output-tokens-reset";
 
 /// Read all supported retry headers using the current time.
+///
+/// Vendor-specific headers are only consulted for the given [`RetryProvider`].
+/// Precedence: `retry-after-ms`, then `retry-after`, then the provider's
+/// reset headers.
 pub fn parse_retry_headers(provider: RetryProvider, headers: &HeaderMap) -> Option<RetryDirective> {
     parse_retry_headers_at(provider, headers, SystemTime::now())
 }
@@ -297,6 +317,7 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
+    /// Creates a policy with the given attempt count and default timings.
     pub fn new(max_attempts: u32) -> Self {
         Self {
             max_attempts,
@@ -304,31 +325,37 @@ impl RetryPolicy {
         }
     }
 
+    /// Sets the total attempt count, including the first request.
     pub fn max_attempts(mut self, max_attempts: u32) -> Self {
         self.max_attempts = max_attempts;
         self
     }
 
+    /// Sets the base delay for exponential backoff.
     pub fn base_delay(mut self, base_delay: Duration) -> Self {
         self.base_delay = base_delay;
         self
     }
 
+    /// Sets the upper bound for computed backoff delays.
     pub fn max_delay(mut self, max_delay: Duration) -> Self {
         self.max_delay = max_delay;
         self
     }
 
+    /// Sets the fractional jitter around the computed delay.
     pub fn jitter_ratio(mut self, jitter_ratio: f32) -> Self {
         self.jitter_ratio = jitter_ratio;
         self
     }
 
+    /// Sets the largest accepted server-directed `Retry-After`.
     pub fn max_retry_after(mut self, max_retry_after: Duration) -> Self {
         self.max_retry_after = max_retry_after;
         self
     }
 
+    /// Toggles whether replaying requires an idempotency key.
     pub fn require_idempotency_key(mut self, require_idempotency_key: bool) -> Self {
         self.require_idempotency_key = require_idempotency_key;
         self
@@ -367,7 +394,16 @@ impl RetryPolicy {
 /// Retry an async operation according to a [`RetryPolicy`].
 ///
 /// The operation closure is called again for every attempt, so each request
-/// body and HTTP request can be rebuilt cleanly.
+/// body and HTTP request can be rebuilt cleanly. Only retryable errors are
+/// replayed, and a server-directed delay larger than
+/// [`RetryPolicy::max_retry_after`] stops retrying immediately.
+///
+/// # Errors
+///
+/// Returns the operation's error once it succeeds, the error is not
+/// retryable, the allowed attempts are exhausted, or the delay would exceed
+/// the policy limit. Returns [`Error::InvalidRetryPolicy`] if
+/// `policy.max_attempts` is zero.
 pub async fn retry_async<F, Fut, T>(policy: &RetryPolicy, mut operation: F) -> Result<T>
 where
     F: FnMut() -> Fut,

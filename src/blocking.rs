@@ -21,6 +21,13 @@ impl<A> BlockingAdapter<A>
 where
     A: ModelAdapter,
 {
+    /// Creates a blocking adapter around `inner`, backed by a dedicated
+    /// single-threaded Tokio runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when called from inside a Tokio runtime, or when the
+    /// blocking runtime cannot be created.
     pub fn new(inner: A) -> Result<Self> {
         ensure_sync_context()?;
         let runtime = Runtime::new().map_err(|error| {
@@ -32,19 +39,33 @@ where
         })
     }
 
+    /// Borrows the wrapped async adapter.
     pub fn inner(&self) -> &A {
         &self.inner
     }
 
+    /// Consumes the wrapper and returns the wrapped async adapter.
     pub fn into_inner(self) -> A {
         self.inner
     }
 
+    /// Blocking version of [`ModelAdapter::complete`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when called from inside a Tokio runtime, or the
+    /// underlying adapter error.
     pub fn complete(&self, request: &ChatRequest) -> Result<ChatResponse> {
         ensure_sync_context()?;
         self.runtime.block_on(self.inner.complete(request))
     }
 
+    /// Blocking version of [`ModelAdapter::complete_with`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when called from inside a Tokio runtime, or the
+    /// underlying adapter error.
     pub fn complete_with(
         &self,
         request: &ChatRequest,
@@ -55,6 +76,12 @@ where
             .block_on(self.inner.complete_with(request, options))
     }
 
+    /// Blocking version of [`ModelAdapter::stream`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when called from inside a Tokio runtime, or the
+    /// underlying adapter error.
     pub fn stream(&self, request: &ChatRequest) -> Result<BlockingStream> {
         ensure_sync_context()?;
         let stream = self.runtime.block_on(self.inner.stream(request))?;
@@ -64,6 +91,12 @@ where
         })
     }
 
+    /// Blocking version of [`ModelAdapter::stream_with`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when called from inside a Tokio runtime, or the
+    /// underlying adapter error.
     pub fn stream_with(
         &self,
         request: &ChatRequest,
@@ -87,6 +120,11 @@ pub struct BlockingStream {
 }
 
 impl BlockingStream {
+    /// Blocks until the next stream event is available, returning `None`
+    /// when the stream has ended.
+    ///
+    /// Calling this from inside a Tokio runtime yields a single
+    /// `Err(Error::InvalidRequest)` item instead of panicking.
     pub fn next_event(&mut self) -> Option<Result<StreamEvent>> {
         if let Err(error) = ensure_sync_context() {
             return Some(Err(error));

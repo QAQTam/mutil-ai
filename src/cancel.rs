@@ -20,6 +20,7 @@ struct CancelState {
 }
 
 impl CancellationToken {
+    /// Creates a token that is not cancelled.
     pub fn new() -> Self {
         let (sender, receiver) = watch::channel(false);
         Self {
