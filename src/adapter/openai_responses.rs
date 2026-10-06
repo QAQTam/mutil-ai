@@ -673,6 +673,14 @@ impl ResponsesStreamMapper {
         self.push_start(&mut events);
 
         let mut normalized = from_responses_response(response.clone())?;
+        if normalized.message.parts.is_empty() && !self.parts.is_empty() {
+            // Compatible endpoints that omit the authoritative `output` array
+            // on `response.completed` still streamed their items through
+            // `output_item.done`; backfill them from the accumulator so the
+            // terminal response is never empty.
+            normalized.message =
+                Message::new(Role::Assistant, self.accumulated_parts());
+        }
         normalized.metadata = Some(self.metadata.clone());
         normalized.report = self.report.clone();
         self.usage = normalized.usage.clone();
@@ -694,20 +702,7 @@ impl ResponsesStreamMapper {
         Ok(events)
     }
 
-    fn finish_events(&mut self) -> Result<Vec<StreamEvent>> {
-        if self.done {
-            return Ok(Vec::new());
-        }
-        if let Some(response) = self.final_response.take() {
-            self.done = true;
-            return Ok(vec![StreamEvent::Done {
-                response: Box::new(response),
-                finish_reason: self.finish_reason.clone(),
-            }]);
-        }
-
-        let mut events = Vec::new();
-        self.push_start(&mut events);
+    fn accumulated_parts(&mut self) -> Vec<Part> {
         let mut parts = Vec::new();
 
         for part in std::mem::take(&mut self.parts).into_values() {
@@ -766,6 +761,25 @@ impl ResponsesStreamMapper {
             }
         }
 
+        parts
+    }
+
+    fn finish_events(&mut self) -> Result<Vec<StreamEvent>> {
+        if self.done {
+            return Ok(Vec::new());
+        }
+        if let Some(response) = self.final_response.take() {
+            self.done = true;
+            return Ok(vec![StreamEvent::Done {
+                response: Box::new(response),
+                finish_reason: self.finish_reason.clone(),
+            }]);
+        }
+
+        let mut events = Vec::new();
+        self.push_start(&mut events);
+        let parts = self.accumulated_parts();
+
         let response = ChatResponse {
             message: Message::new(Role::Assistant, parts),
             usage: self.usage.clone(),
@@ -781,7 +795,6 @@ impl ResponsesStreamMapper {
         Ok(events)
     }
 }
-
 impl SseMapper for ResponsesStreamMapper {
     fn map(&mut self, message: SseMessage) -> Result<Vec<StreamEvent>> {
         if message.data.trim() == "[DONE]" {
@@ -1530,5 +1543,68 @@ mod tests {
         assert_eq!(response.reasoning_text(), "先查资料。");
         assert_eq!(response.tool_calls().next().unwrap().name, "lookup");
         assert_eq!(response.usage.as_ref().unwrap().input_tokens, Some(12));
+    }
+
+    #[test]
+    fn completed_without_output_backfills_accumulated_items() {
+        let metadata = ResponseMetadata {
+            status: 200,
+            request_id: None,
+            headers: HeaderMap::new(),
+        };
+        let mut mapper = ResponsesStreamMapper::new("gpt-5".to_string(), metadata);
+        for event in [
+            json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "item_id": "msg_1",
+                "content_index": 0,
+                "delta": "answer"
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 1,
+                "item_id": "fc_1",
+                "delta": "{\"q\":\"Rust\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{\"q\":\"Rust\"}"
+                }
+            }),
+        ] {
+            mapper
+                .map(SseMessage {
+                    event: None,
+                    data: event.to_string(),
+                    id: None,
+                })
+                .expect("stream event");
+        }
+        let events = mapper
+            .map(SseMessage {
+                event: None,
+                data: json!({
+                    "type": "response.completed",
+                    "response": {"status": "completed"}
+                })
+                .to_string(),
+                id: None,
+            })
+            .expect("completed");
+        let StreamEvent::Done { response, .. } = events.last().expect("done event") else {
+            panic!("expected done event");
+        };
+        assert_eq!(response.text(), "answer");
+        let call = response.tool_calls().next().expect("backfilled tool call");
+        assert_eq!(call.name, "lookup");
+        assert_eq!(call.arguments, json!({"q": "Rust"}));
+        assert!(response.raw.is_object(), "real terminal keeps the response object");
     }
 }
