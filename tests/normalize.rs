@@ -317,3 +317,52 @@ fn system_placement_default_merges_everything_to_top() {
     let roles: Vec<_> = normalized.messages.iter().map(|m| m.role.clone()).collect();
     assert_eq!(roles, vec![mutil_ai::ExternalRole::User]);
 }
+
+#[test]
+fn tool_parts_flattened_into_a_user_message_are_reported() {
+    let request = ChatRequest::new([
+        Message::user("hello"),
+        Message::new(
+            Role::User,
+            vec![
+                Part::ToolResult(ToolResult::new(None, "lookup", "output")),
+                Part::ToolCall(ToolCall::new("other", json!({})).with_id("call_9")),
+            ],
+        ),
+    ]);
+
+    let (clean, report) = normalize(&request, Protocol::OpenAiChat).unwrap();
+
+    // The rewrite still happens, but it is no longer invisible: a caller that
+    // trusts `is_clean` must be able to see that tool state became plain text.
+    assert!(!report.is_clean());
+    assert_eq!(report.stats().flattened_tool_result, 1);
+    assert_eq!(report.stats().flattened_tool_call, 1);
+    let reported = report.actions.iter().any(|a| {
+        matches!(
+            a,
+            NormalizeAction::FlattenedToolResultIntoText { name } if name == "lookup"
+        )
+    });
+    assert!(reported);
+    let last = clean.messages.last().expect("message");
+    assert_eq!(last.role, ExternalRole::User);
+    assert!(matches!(last.parts[0], Part::Text { .. }));
+}
+
+#[test]
+fn drop_tool_call_does_not_leave_an_empty_assistant_message() {
+    let request = ChatRequest::new([
+        Message::user("hello"),
+        Message::assistant_with_tools("", [ToolCall::new("lookup", json!({}))]),
+    ]);
+    let options = NormalizeOptions {
+        missing_tool_result: MissingToolResultPolicy::DropToolCall,
+        ..NormalizeOptions::for_protocol(Protocol::OpenAiChat)
+    };
+
+    let (clean, _) = normalize_with_options(&request, options).unwrap();
+
+    let roles: Vec<_> = clean.messages.iter().map(|m| m.role.clone()).collect();
+    assert_eq!(roles, vec![ExternalRole::User]);
+}

@@ -11,6 +11,9 @@ A provider-neutral model-invocation SDK for Rust beginners.
 
 ## Installation
 
+**0.5.0:** fixes tool-result pairing, so a correct call id with a differing tool
+name no longer drops real tool output. See [docs/migration-0.5.md](docs/migration-0.5.md).
+
 **0.4.1:** adds Apache-2.0 as an alternative to MIT, with no API or runtime changes.
 
 **0.4.0 security release:** this version tightens authentication, tool pairing,
@@ -103,10 +106,11 @@ What strict providers fear most is "a tool call without a tool result" or "a too
 This library's default rules:
 
 1. An assistant `ToolCall` without an id: automatically assigned `call_1`, `call_2`, etc.
-2. A tool result without an id: matched by tool name and given the corresponding id.
-3. A tool call with no following result: an error result is synthesized automatically, guaranteeing complete pairing.
-4. Orphan tool results: dropped by default, to avoid polluting upstream.
-5. Anthropic / Gemini: adjacent user/assistant messages are merged, and tool results are placed into the user turn.
+2. A tool result with an id: paired by that id alone; the tool name is taken from the call it matched.
+3. A tool result without an id: matched by tool name and given the corresponding id.
+4. A tool call with no following result: an error result is synthesized automatically, guaranteeing complete pairing.
+5. Orphan tool results: dropped by default, to avoid polluting upstream. Every drop — and every tool part flattened into plain text on a user/system message — is recorded in the report.
+6. Anthropic / Gemini: adjacent user/assistant messages are merged, and tool results are placed into the user turn.
 
 You can run the example directly to see the cleanup process:
 
@@ -1126,7 +1130,7 @@ Key point: **role conversion, tool repairs, and cross-provider reasoning cleanup
 
 ## 12. What the current version deliberately does not do
 
-This is v0.4.1; the current priority is getting roles, tool pairing, retry, SSE, reasoning, unified streaming, cancellation, and the generic provider extension boundary clearly defined. For now, the following are out of scope:
+This is v0.5.0; the current priority is getting roles, tool pairing, retry, SSE, reasoning, unified streaming, cancellation, and the generic provider extension boundary clearly defined. For now, the following are out of scope:
 
 - WebSocket / Realtime
 - OpenAI Responses' `previous_response_id` / `store`

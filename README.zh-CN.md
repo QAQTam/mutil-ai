@@ -11,6 +11,8 @@
 
 ## 安装
 
+**0.5.0：** 修正工具配对：call id 正确但工具名不一致时，不再丢弃真实工具输出。见 [docs/migration-0.5.md](docs/migration-0.5.md)。
+
 **0.4.1：** 新增 Apache-2.0 可选许可，保留 MIT；无 API 或运行行为变化。
 
 **0.4.0 安全修复版：** 本次收紧认证、工具配对、流重放、响应资源预算与总超时语义，
@@ -105,10 +107,11 @@ System / User / Assistant / Tool
 本库默认规则：
 
 1. assistant 的 `ToolCall` 没有 id：自动补 `call_1`、`call_2`。
-2. tool result 没有 id：按工具名匹配，补上对应 id。
-3. tool call 后面没有 result：自动合成一个错误 result，保证配对完整。
-4. 孤儿 tool result：默认丢弃，避免污染上游。
-5. Anthropic / Gemini：合并相邻 user/assistant 消息，并把 tool result 放进 user turn。
+2. tool result 带 id：只按这个 id 配对，工具名取自己匹配到的那个 call。
+3. tool result 没有 id：按工具名匹配，补上对应 id。
+4. tool call 后面没有 result：自动合成一个错误 result，保证配对完整。
+5. 孤儿 tool result：默认丢弃，避免污染上游。每次丢弃、以及被压成文本写进 user/system 消息的工具内容，都会记入 report。
+6. Anthropic / Gemini：合并相邻 user/assistant 消息，并把 tool result 放进 user turn。
 
 可以直接运行示例查看清洗过程：
 
@@ -1177,7 +1180,7 @@ examples/
 
 ## 12. 当前版本刻意不做的内容
 
-这是 v0.4.1,目前优先把 role、工具配对、retry、SSE、reasoning、统一
+这是 v0.5.0,目前优先把 role、工具配对、retry、SSE、reasoning、统一
 streaming、取消和通用 provider 扩展边界讲清楚，因此暂时不做：
 
 - WebSocket / Realtime

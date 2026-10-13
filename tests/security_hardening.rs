@@ -208,6 +208,86 @@ fn explicit_wrong_call_id_is_not_matched_by_name() {
 }
 
 #[test]
+fn matching_call_id_pairs_the_result_even_when_names_differ() {
+    // The call id is the identity; the normalizer reconciles the name from the
+    // pending call, so a result carrying a blank or display name must still pair.
+    for result_name in ["", "Confirm Project", "lookup"] {
+        let request = ChatRequest::new([
+            Message::user("hello"),
+            Message::assistant_with_tools(
+                "",
+                [ToolCall::new("lookup", json!({})).with_id("call_1")],
+            ),
+            Message::tool_result(ToolResult::new(
+                Some("call_1".into()),
+                result_name,
+                "real tool output",
+            )),
+        ]);
+        let (clean, report) = normalize(&request, Protocol::OpenAiChat).unwrap();
+        let results: Vec<_> = clean
+            .messages
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                Part::ToolResult(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(results.len(), 1, "result_name={result_name:?}");
+        assert_eq!(
+            results[0].content, "real tool output",
+            "result_name={result_name:?}"
+        );
+        assert_eq!(results[0].name, "lookup", "result_name={result_name:?}");
+        assert_eq!(results[0].call_id.as_deref(), Some("call_1"));
+        assert!(
+            !report.actions.iter().any(|action| matches!(
+                action,
+                mutil_ai::NormalizeAction::DroppedOrphanToolResult { .. }
+            )),
+            "result_name={result_name:?} leaked as an orphan: {:?}",
+            report.actions
+        );
+    }
+}
+
+#[test]
+fn synthetic_call_id_still_pairs_a_result_that_keeps_the_provider_id() {
+    // A history whose assistant tool call lost its id gets a generated id, which
+    // can never equal the real provider id on the result. Pairing falls back to
+    // the name and rewrites the id so the wire stays self-consistent.
+    let request = ChatRequest::new([
+        Message::assistant_with_tools("", [ToolCall::new("lookup", json!({}))]),
+        Message::tool_result(ToolResult::new(
+            Some("call_0".into()),
+            "lookup",
+            "real tool output",
+        )),
+    ]);
+    let (clean, report) = normalize(&request, Protocol::OpenAiChat).unwrap();
+    let results: Vec<_> = clean
+        .messages
+        .iter()
+        .flat_map(|m| &m.parts)
+        .filter_map(|p| match p {
+            Part::ToolResult(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].content, "real tool output");
+    assert!(!results[0].is_error);
+    assert_eq!(results[0].call_id.as_deref(), Some("call_1"));
+    assert!(report.actions.iter().any(
+        |a| matches!(a, mutil_ai::NormalizeAction::ReconciledToolResultId { from, to, .. }
+                if from == "call_0" && to == "call_1")
+    ));
+}
+
+#[test]
 fn generated_tool_call_id_avoids_existing_id() {
     let request = ChatRequest::new([Message::assistant_with_tools(
         "",
