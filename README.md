@@ -61,6 +61,10 @@ For a registry of generic extension capabilities required by downstream gateways
 
 - [`docs/consumer-capability-requirements.md`](docs/consumer-capability-requirements.md)
 
+For the proposed ChatGPT / Codex authentication architecture and implementation handoff (not yet implemented), see:
+
+- [`docs/chatgpt-codex-auth-design.md`](docs/chatgpt-codex-auth-design.md) (Chinese; client/SDK responsibilities, OAuth, plan inference, and optional app-server integration)
+
 ## 1. Core idea
 
 ### Internal roles

@@ -63,6 +63,10 @@ SDK 的长期契约、当前实现和交接清单见：
 
 - [`docs/consumer-capability-requirements.md`](docs/consumer-capability-requirements.md)
 
+ChatGPT / Codex 认证的架构设计与实现交接（尚未实现）见：
+
+- [`docs/chatgpt-codex-auth-design.md`](docs/chatgpt-codex-auth-design.md)（客户端/SDK 职责、OAuth、套餐推理与可选 app-server 集成）
+
 ## 1. 核心思想
 
 ### 内部 role
