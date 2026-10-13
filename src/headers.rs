@@ -14,6 +14,7 @@ use crate::audit::{AuditConfig, AuditContext, AuditRequestMeta, AuditSink, Profi
 use crate::cancel::CancellationToken;
 use crate::error::{Error, Result};
 use crate::profile::ProviderRequestOptions;
+use crate::security::ResponseLimits;
 use crate::stream::StreamReconnectPolicy;
 use crate::transform::RequestTransform;
 
@@ -155,27 +156,40 @@ pub struct RequestOptions {
     pub provider_request: ProviderRequestOptions,
     /// Per-request override for transport audit switches.
     pub audit_config: Option<AuditConfig>,
+    /// Decoded response budgets shared across attempts and reconnects.
+    pub response_limits: ResponseLimits,
 }
 
 impl fmt::Debug for RequestOptions {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RequestOptions")
-            .field("headers", &self.headers)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
             .field("user_agent", &self.user_agent)
-            .field("context", &self.context)
-            .field("idempotency_key", &self.idempotency_key)
+            .field("context", &"<redacted>")
+            .field(
+                "idempotency_key",
+                &self.idempotency_key.as_ref().map(|_| "<redacted>"),
+            )
             .field("timeout", &self.timeout)
             .field("idle_timeout", &self.idle_timeout)
-            .field("extra_query", &self.extra_query)
+            .field(
+                "extra_query_names",
+                &self
+                    .extra_query
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+            )
             .field("stream_reconnect", &self.stream_reconnect)
             .field("cancellation", &self.cancellation)
             .field(
                 "request_transform",
                 &self.request_transform.as_ref().map(|_| "<configured>"),
             )
-            .field("provider_request", &self.provider_request)
+            .field("provider_request", &"<redacted>")
             .field("audit_config", &self.audit_config)
+            .field("response_limits", &self.response_limits)
             .finish()
     }
 }
@@ -184,6 +198,12 @@ impl RequestOptions {
     /// Creates empty per-request options.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replaces response byte/event budgets and raw/progress settings.
+    pub fn response_limits(mut self, limits: ResponseLimits) -> Self {
+        self.response_limits = limits;
+        self
     }
 
     /// Adds one request-level header, replacing any existing value with the
@@ -314,7 +334,15 @@ pub struct HeaderPolicy {
 impl Default for HeaderPolicy {
     fn default() -> Self {
         Self {
-            protected: vec![AUTHORIZATION, CONTENT_TYPE, CONTENT_LENGTH, HOST, ACCEPT],
+            protected: vec![
+                AUTHORIZATION,
+                CONTENT_TYPE,
+                CONTENT_LENGTH,
+                HOST,
+                ACCEPT,
+                HeaderName::from_static("x-api-key"),
+                HeaderName::from_static("x-goog-api-key"),
+            ],
             allow_override: Vec::new(),
         }
     }
@@ -377,7 +405,10 @@ impl fmt::Debug for TransportConfig {
         formatter
             .debug_struct("TransportConfig")
             .field("user_agent", &self.user_agent)
-            .field("default_headers", &self.default_headers)
+            .field(
+                "default_header_names",
+                &self.default_headers.keys().collect::<Vec<_>>(),
+            )
             .field("client_info", &self.client_info)
             .field("header_policy", &self.header_policy)
             .field(
@@ -537,6 +568,11 @@ impl TransportConfig {
         apply_headers(headers, &options.headers, &self.header_policy)?;
 
         if let Some(idempotency_key) = &options.idempotency_key {
+            if idempotency_key.trim().is_empty() {
+                return Err(Error::InvalidRequest(
+                    "idempotency key must not be empty".into(),
+                ));
+            }
             let value = HeaderValue::from_str(idempotency_key)?;
             ensure_ascii_header_value(IDEMPOTENCY_KEY, value.as_bytes())?;
             headers.insert(HeaderName::from_static(IDEMPOTENCY_KEY), value);

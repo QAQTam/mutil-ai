@@ -25,6 +25,7 @@ mod normalize;
 mod profile;
 mod report;
 mod retry;
+mod security;
 mod sse;
 mod stream;
 mod transform;
@@ -54,17 +55,17 @@ pub use normalize::{
 pub use profile::{
     AuthStyle, Capabilities, EffortMapping, EndpointSpec, MaxTokensSemantics, ModelMatcher,
     ModelProfile, NormalizeProfile, ProfileId, ProfileRegistry, ProfileSelector, ProtocolSurface,
-    ProviderProfile,
-    ProviderRequestOptions, ReasoningAliases, ReasoningCapabilities, ReasoningProfile,
-    ReasoningReplayPolicy, RequestProfile, StreamCapabilities, StreamProfile, StreamTerminal,
-    ThinkingRequestProfile, ToolCallContentMode, ToolCallIdPolicy, ToolCapabilities, ToolProfile,
-    UsagePlacement, UsageProfile,
+    ProviderProfile, ProviderRequestOptions, ReasoningAliases, ReasoningCapabilities,
+    ReasoningProfile, ReasoningReplayPolicy, RequestProfile, StreamCapabilities, StreamProfile,
+    StreamTerminal, ThinkingRequestProfile, ToolCallContentMode, ToolCallIdPolicy,
+    ToolCapabilities, ToolProfile, UsagePlacement, UsageProfile,
 };
 pub use report::{CompletionReport, WireAction, WireFeature, WireReport};
 pub use retry::{
     RetryDirective, RetryPolicy, RetryProvider, RetrySource, parse_retry_after,
     parse_retry_after_at, parse_retry_headers, parse_retry_headers_at, retry_async,
 };
+pub use security::ResponseLimits;
 pub use sse::{SseError, SseEvent, SseMessage, SseParser, SseUtf8Policy};
 pub use stream::{
     ModelStream, StreamError, StreamEvent, StreamReconnectPolicy, collect_stream, next_event,

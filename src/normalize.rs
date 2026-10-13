@@ -384,6 +384,15 @@ pub fn normalize_with_options(
     options: NormalizeOptions,
 ) -> Result<(NormalizedChat, NormalizeReport)> {
     let expected_reasoning_format = options.protocol.provider_state_format();
+    let occupied_call_ids = request
+        .messages
+        .iter()
+        .flat_map(|message| &message.parts)
+        .filter_map(|part| match part {
+            Part::ToolCall(call) => call.id.clone(),
+            _ => None,
+        })
+        .collect();
     let mut normalizer = Normalizer {
         options,
         report: NormalizeReport::default(),
@@ -391,6 +400,8 @@ pub fn normalize_with_options(
         messages: Vec::new(),
         pending_calls: Vec::new(),
         next_call_id: 1,
+        occupied_call_ids,
+        seen_call_ids: std::collections::HashSet::new(),
         expected_reasoning_format,
         top_taken: false,
     };
@@ -418,6 +429,8 @@ struct Normalizer {
     messages: Vec<NormalizedMessage>,
     pending_calls: Vec<PendingCall>,
     next_call_id: u64,
+    occupied_call_ids: std::collections::HashSet<String>,
+    seen_call_ids: std::collections::HashSet<String>,
     expected_reasoning_format: ProviderStateFormat,
     /// True once a system message has claimed the top-level slot under
     /// `SystemPlacement::FirstToTopRestInPlace`.
@@ -566,8 +579,13 @@ impl Normalizer {
                         call.provider_state = None;
                     }
                     if call.id.is_none() {
-                        let id = format!("call_{}", self.next_call_id);
-                        self.next_call_id += 1;
+                        let id = loop {
+                            let id = format!("call_{}", self.next_call_id);
+                            self.next_call_id += 1;
+                            if self.occupied_call_ids.insert(id.clone()) {
+                                break id;
+                            }
+                        };
                         call.id = Some(id.clone());
                         self.report
                             .actions
@@ -578,6 +596,11 @@ impl Normalizer {
                     }
 
                     let id = call.id.clone().expect("id was assigned above");
+                    if id.trim().is_empty() || !self.seen_call_ids.insert(id.clone()) {
+                        return Err(Error::Normalize(
+                            "tool call IDs must be non-empty and unique".into(),
+                        ));
+                    }
                     self.pending_calls.push(PendingCall {
                         id: id.clone(),
                         name: call.name.clone(),
@@ -669,13 +692,10 @@ impl Normalizer {
     }
 
     fn find_pending_call(&self, result: &ToolResult) -> Option<usize> {
-        if let Some(call_id) = &result.call_id
-            && let Some(index) = self
-                .pending_calls
-                .iter()
-                .position(|call| call.id == *call_id)
-        {
-            return Some(index);
+        if let Some(call_id) = &result.call_id {
+            return self.pending_calls.iter().position(|call| {
+                call.id == *call_id && !call.fulfilled && call.name == result.name
+            });
         }
 
         self.pending_calls

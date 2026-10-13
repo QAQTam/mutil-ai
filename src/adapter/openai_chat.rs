@@ -1,3 +1,4 @@
+use crate::security::{RequestBudget, ResponseLimits};
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
@@ -81,7 +82,7 @@ impl OpenAIChat {
             base_url: "https://api.openai.com/v1".to_string(),
             retry_policy: RetryPolicy::default(),
             transport: TransportConfig::default(),
-            client: reqwest::Client::new(),
+            client: super::secure_http_client(),
         }
     }
 
@@ -130,6 +131,7 @@ impl ModelAdapter for OpenAIChat {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ChatResponse> {
+        let budget = RequestBudget::new(options)?;
         let transformed = apply_request_transform(request, options)?;
         let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
         let request = transformed.as_ref();
@@ -177,6 +179,7 @@ impl ModelAdapter for OpenAIChat {
             &retry_policy,
             audit.as_ref(),
             options.cancellation.as_ref(),
+            &budget,
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -212,7 +215,10 @@ impl ModelAdapter for OpenAIChat {
             }
         };
 
-        let mut response = match from_openai_chat_response(value) {
+        let mut response = match from_openai_chat_response(value).and_then(|response| {
+            budget.check_deadline()?;
+            Ok(response)
+        }) {
             Ok(response) => response,
             Err(error) => {
                 if let Some(audit) = &audit {
@@ -227,6 +233,9 @@ impl ModelAdapter for OpenAIChat {
                 return Err(error);
             }
         };
+        if !budget.limits.retain_raw {
+            response.raw = serde_json::Value::Null;
+        }
         response.report = completion_report(
             Protocol::OpenAiChat,
             request,
@@ -251,6 +260,7 @@ impl ModelAdapter for OpenAIChat {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ModelStream> {
+        let budget = RequestBudget::new(options)?;
         let transformed = apply_request_transform(request, options)?;
         let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
         let request = transformed.as_ref();
@@ -302,6 +312,7 @@ impl ModelAdapter for OpenAIChat {
             &retry_policy,
             audit.as_ref(),
             options.cancellation.as_ref(),
+            &budget,
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -344,6 +355,7 @@ impl ModelAdapter for OpenAIChat {
         );
         let reconnect = options.stream_reconnect.map(|_| {
             ReconnectRequest::new(ReconnectRequestParts {
+                budget: budget.clone(),
                 provider: self.provider_name(),
                 client: self.client.clone(),
                 retry_policy: retry_policy.clone(),
@@ -365,6 +377,7 @@ impl ModelAdapter for OpenAIChat {
             options.cancellation.clone(),
             options.idle_timeout,
             audit,
+            budget,
         ))
     }
 }
@@ -853,6 +866,7 @@ struct OpenAiToolCallAccumulator {
     id: Option<String>,
     name: String,
     arguments: String,
+    last_progress_bytes: Option<usize>,
 }
 
 /// Stateful SSE mapper that turns OpenAI Chat Completions stream chunks into
@@ -873,6 +887,7 @@ pub(crate) struct OpenAiChatStreamMapper {
     usage: Option<Usage>,
     finish_reason: Option<String>,
     chunks: Vec<Value>,
+    limits: ResponseLimits,
     report: CompletionReport,
 }
 
@@ -904,6 +919,7 @@ impl OpenAiChatStreamMapper {
             usage: None,
             finish_reason: None,
             chunks: Vec::new(),
+            limits: ResponseLimits::default(),
             report: CompletionReport::default(),
         }
     }
@@ -972,13 +988,22 @@ impl OpenAiChatStreamMapper {
             parts.push(Part::text(&self.text));
         }
         for (index, call) in &self.tool_calls {
+            if call.last_progress_bytes != Some(call.arguments.len()) {
+                events.push(StreamEvent::ToolCallProgress {
+                    index: *index,
+                    id: call.id.clone(),
+                    name: Some(call.name.clone()),
+                    arguments_so_far: call.arguments.clone(),
+                });
+            }
             let arguments = if call.arguments.trim().is_empty() {
                 json!({})
             } else {
                 parse_json_or_string(&call.arguments)
             };
             parts.push(Part::ToolCall(ToolCall {
-                id: call.id.clone().or_else(|| Some(format!("call_{index}"))),
+                // Missing native IDs are assigned collision-free by normalization.
+                id: call.id.clone(),
                 name: call.name.clone(),
                 arguments,
                 provider_state: None,
@@ -988,7 +1013,11 @@ impl OpenAiChatStreamMapper {
         let response = ChatResponse {
             message: Message::new(Role::Assistant, parts),
             usage: self.usage.clone(),
-            raw: Value::Array(self.chunks.clone()),
+            raw: if self.limits.retain_raw {
+                Value::Array(std::mem::take(&mut self.chunks))
+            } else {
+                Value::Null
+            },
             metadata: Some(self.metadata.clone()),
             report: self.report.clone(),
         };
@@ -1001,6 +1030,9 @@ impl OpenAiChatStreamMapper {
 }
 
 impl SseMapper for OpenAiChatStreamMapper {
+    fn configure_limits(&mut self, limits: ResponseLimits) {
+        self.limits = limits;
+    }
     fn map(&mut self, message: SseMessage) -> Result<Vec<StreamEvent>> {
         if message.data.trim() == "[DONE]" {
             return Ok(self.done_events());
@@ -1010,7 +1042,9 @@ impl SseMapper for OpenAiChatStreamMapper {
         if let Some(error) = chunk.get("error") {
             return Err(Error::ProviderStream(error.to_string()));
         }
-        self.chunks.push(chunk.clone());
+        if self.limits.retain_raw {
+            self.chunks.push(chunk.clone());
+        }
 
         let mut events = Vec::new();
         self.push_start(&mut events);
@@ -1133,25 +1167,42 @@ impl SseMapper for OpenAiChatStreamMapper {
                 {
                     accumulator.name.clone_from(name);
                 }
+                if accumulator
+                    .arguments
+                    .len()
+                    .saturating_add(arguments_delta.len())
+                    > self.limits.max_tool_argument_bytes
+                {
+                    return Err(Error::ResponseLimit {
+                        resource: "tool argument bytes",
+                        limit: self.limits.max_tool_argument_bytes,
+                    });
+                }
                 accumulator.arguments.push_str(&arguments_delta);
 
                 let progress_id = accumulator.id.clone().or_else(|| id.clone());
                 let progress_name = (!accumulator.name.is_empty())
                     .then(|| accumulator.name.clone())
                     .or_else(|| name.clone());
-                let arguments_so_far = accumulator.arguments.clone();
+                let emit_progress = accumulator.last_progress_bytes.is_none_or(|last| {
+                    accumulator.arguments.len().saturating_sub(last)
+                        >= self.limits.tool_progress_interval_bytes
+                });
                 events.push(StreamEvent::ToolCallDelta {
                     index,
                     id,
                     name,
                     arguments_delta,
                 });
-                events.push(StreamEvent::ToolCallProgress {
-                    index,
-                    id: progress_id,
-                    name: progress_name,
-                    arguments_so_far,
-                });
+                if emit_progress {
+                    accumulator.last_progress_bytes = Some(accumulator.arguments.len());
+                    events.push(StreamEvent::ToolCallProgress {
+                        index,
+                        id: progress_id,
+                        name: progress_name,
+                        arguments_so_far: accumulator.arguments.clone(),
+                    });
+                }
             }
         }
 
@@ -1479,14 +1530,12 @@ mod tests {
                 vec![crate::types::Part::text("skill body")],
             ),
         ]);
-        let (normalized, _report) = super::super::normalize_for_protocol(
-            &request,
-            Protocol::OpenAiChat,
-            Some(&profile),
-        )
-        .expect("normalize");
-        let body = to_openai_chat_body_with_profile("m", &normalized, &request, Some(&profile), None)
-            .expect("body");
+        let (normalized, _report) =
+            super::super::normalize_for_protocol(&request, Protocol::OpenAiChat, Some(&profile))
+                .expect("normalize");
+        let body =
+            to_openai_chat_body_with_profile("m", &normalized, &request, Some(&profile), None)
+                .expect("body");
         let msgs = body["messages"].as_array().expect("messages");
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[0]["content"], "base");

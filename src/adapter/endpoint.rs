@@ -1,3 +1,4 @@
+use crate::security::RequestBudget;
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
@@ -36,6 +37,13 @@ use crate::types::{ChatRequest, ChatResponse, Part, ResponseMetadata};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+fn auth_transport(mut transport: TransportConfig, auth: &AuthStyle) -> TransportConfig {
+    if let AuthStyle::XApiKey { header } | AuthStyle::Custom { header, .. } = auth {
+        transport.header_policy = transport.header_policy.protect(header.clone());
+    }
+    transport
+}
+
 /// A protocol-dispatching adapter for explicitly configured endpoints.
 ///
 /// The caller selects the protocol, path, and auth through [`EndpointSpec`].
@@ -66,6 +74,7 @@ impl EndpointAdapter {
     /// the request path, and the auth style.
     pub fn new(model: impl Into<String>, endpoint: EndpointSpec) -> Self {
         let provider_profile = endpoint.resolved_profile();
+        let transport = auth_transport(TransportConfig::default(), &endpoint.auth);
         Self {
             model: model.into(),
             endpoint,
@@ -74,8 +83,8 @@ impl EndpointAdapter {
             api_key_env: None,
             model_profiles: Vec::new(),
             retry_policy: RetryPolicy::default(),
-            transport: TransportConfig::default(),
-            client: reqwest::Client::new(),
+            transport,
+            client: super::secure_http_client(),
         }
     }
 
@@ -99,7 +108,7 @@ impl EndpointAdapter {
 
     /// Configure transport-level settings (timeouts, proxies, audit hooks).
     pub fn transport(mut self, transport: TransportConfig) -> Self {
-        self.transport = transport;
+        self.transport = auth_transport(transport, &self.endpoint.auth);
         self
     }
 
@@ -354,7 +363,9 @@ impl EndpointAdapter {
             _ => &[],
         };
         for (name, _) in &query {
-            if reserved_query.contains(&name.as_str()) {
+            if reserved_query.contains(&name.as_str())
+                || matches!(&self.endpoint.auth, AuthStyle::QueryKey { parameter } if name == parameter)
+            {
                 return Err(Error::ReservedExtraQuery {
                     protocol: protocol_name(self.endpoint.protocol),
                     parameter: name.clone(),
@@ -500,6 +511,7 @@ impl EndpointAdapter {
         idle_timeout: Option<std::time::Duration>,
         report: CompletionReport,
         audit: Option<AuditContext>,
+        budget: RequestBudget,
     ) -> ModelStream {
         let metadata = ResponseMetadata::from_response(&response);
         match self.endpoint.protocol {
@@ -516,6 +528,7 @@ impl EndpointAdapter {
                 cancellation,
                 idle_timeout,
                 audit,
+                budget,
             ),
             Protocol::OpenAiResponses => finish_sse_stream(
                 response,
@@ -525,6 +538,7 @@ impl EndpointAdapter {
                 cancellation,
                 idle_timeout,
                 audit,
+                budget,
             ),
             Protocol::AnthropicMessages => finish_sse_stream(
                 response,
@@ -534,6 +548,7 @@ impl EndpointAdapter {
                 cancellation,
                 idle_timeout,
                 audit,
+                budget,
             ),
             Protocol::GeminiGenerateContent => finish_sse_stream(
                 response,
@@ -543,6 +558,7 @@ impl EndpointAdapter {
                 cancellation,
                 idle_timeout,
                 audit,
+                budget,
             ),
         }
     }
@@ -563,6 +579,7 @@ impl ModelAdapter for EndpointAdapter {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ChatResponse> {
+        let budget = RequestBudget::new(options)?;
         self.ensure_supported()?;
         let transformed = apply_request_transform(request, options)?;
         let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
@@ -596,6 +613,7 @@ impl ModelAdapter for EndpointAdapter {
             &retry_policy,
             audit.as_ref(),
             options.cancellation.as_ref(),
+            &budget,
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -628,7 +646,10 @@ impl ModelAdapter for EndpointAdapter {
             }
         };
 
-        let mut response = match self.parse_response(value) {
+        let mut response = match self.parse_response(value).and_then(|response| {
+            budget.check_deadline()?;
+            Ok(response)
+        }) {
             Ok(response) => response,
             Err(error) => {
                 if let Some(audit) = &audit {
@@ -643,6 +664,9 @@ impl ModelAdapter for EndpointAdapter {
                 return Err(error);
             }
         };
+        if !budget.limits.retain_raw {
+            response.raw = serde_json::Value::Null;
+        }
         response.report = completion_report(
             self.endpoint.protocol,
             request,
@@ -667,6 +691,7 @@ impl ModelAdapter for EndpointAdapter {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ModelStream> {
+        let budget = RequestBudget::new(options)?;
         self.ensure_supported()?;
         let transformed = apply_request_transform(request, options)?;
         let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
@@ -700,6 +725,7 @@ impl ModelAdapter for EndpointAdapter {
             &retry_policy,
             audit.as_ref(),
             options.cancellation.as_ref(),
+            &budget,
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -733,6 +759,7 @@ impl ModelAdapter for EndpointAdapter {
 
         let reconnect = options.stream_reconnect.map(|_| {
             ReconnectRequest::new(ReconnectRequestParts {
+                budget: budget.clone(),
                 provider,
                 client: self.client.clone(),
                 retry_policy: retry_policy.clone(),
@@ -759,6 +786,7 @@ impl ModelAdapter for EndpointAdapter {
                 transform_applied,
             ),
             audit,
+            budget,
         ))
     }
 }
@@ -789,10 +817,10 @@ mod tests {
                 "{protocol:?} must merge everything to top"
             );
             assert!(
-                !normalized.messages.iter().any(|m| matches!(
-                    m.role,
-                    ExternalRole::System | ExternalRole::Developer
-                )),
+                !normalized
+                    .messages
+                    .iter()
+                    .any(|m| matches!(m.role, ExternalRole::System | ExternalRole::Developer)),
                 "{protocol:?} must not receive in-place instruction messages"
             );
         }

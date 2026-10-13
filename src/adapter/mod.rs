@@ -22,6 +22,7 @@ use crate::profile::{
 };
 use crate::report::{CompletionReport, WireAction, WireFeature};
 use crate::retry::{RetryPolicy, RetryProvider, next_delay, parse_retry_headers};
+use crate::security::RequestBudget;
 use crate::stream::{ModelStream, StreamReconnectPolicy, sse_stream_with_reconnect};
 use crate::types::{ChatRequest, ResponseMetadata, ToolChoice, ToolSpec};
 
@@ -30,6 +31,13 @@ pub use endpoint::{EndpointAdapter, OpenAICompatible};
 pub use gemini::{Gemini, GeminiGenerateContent};
 pub use openai_chat::{OpenAI, OpenAIChat};
 pub use openai_responses::OpenAIResponses;
+
+pub(crate) fn secure_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("static SDK HTTP client configuration must be valid")
+}
 
 /// A provider adapter.
 ///
@@ -250,6 +258,10 @@ pub(crate) async fn prepare_headers(
 ) -> Result<HeaderMap> {
     let mut headers = base_headers.clone();
     transport.apply_to_async(&mut headers, options).await?;
+    // Sensitivity is log metadata, not a wire change. Mark custom auth as well.
+    for value in headers.values_mut() {
+        value.set_sensitive(true);
+    }
     Ok(headers)
 }
 
@@ -450,6 +462,7 @@ pub(crate) fn completion_report(
 }
 
 pub(crate) struct ReconnectRequest {
+    budget: RequestBudget,
     provider: &'static str,
     client: reqwest::Client,
     retry_policy: RetryPolicy,
@@ -464,6 +477,7 @@ pub(crate) struct ReconnectRequest {
 }
 
 pub(crate) struct ReconnectRequestParts {
+    pub budget: RequestBudget,
     pub provider: &'static str,
     pub client: reqwest::Client,
     pub retry_policy: RetryPolicy,
@@ -480,6 +494,7 @@ pub(crate) struct ReconnectRequestParts {
 impl ReconnectRequest {
     pub(crate) fn new(parts: ReconnectRequestParts) -> Self {
         Self {
+            budget: parts.budget,
             provider: parts.provider,
             client: parts.client,
             retry_policy: parts.retry_policy,
@@ -509,6 +524,7 @@ impl ReconnectRequest {
         let base_headers = self.base_headers.clone();
         let query = self.query.clone();
         let body = self.body.clone();
+        let budget = self.budget.clone();
 
         Box::pin(async move {
             let cancellation = options.cancellation.clone();
@@ -518,6 +534,7 @@ impl ReconnectRequest {
                 &retry_policy,
                 audit.as_ref(),
                 cancellation.as_ref(),
+                &budget,
                 || async {
                     let mut headers = prepare_headers(&transport, &base_headers, &options).await?;
                     if let Some(last_event_id) = &last_event_id {
@@ -539,18 +556,21 @@ impl ReconnectRequest {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_sse_stream<M>(
     response: reqwest::Response,
-    mapper: M,
+    mut mapper: M,
     policy: Option<StreamReconnectPolicy>,
     reconnect: Option<ReconnectRequest>,
     cancellation: Option<CancellationToken>,
     idle_timeout: Option<std::time::Duration>,
     audit: Option<AuditContext>,
+    budget: RequestBudget,
 ) -> ModelStream
 where
     M: crate::stream::SseMapper,
 {
+    mapper.configure_limits(budget.limits);
     match (policy, reconnect) {
         (Some(policy), Some(reconnect)) => sse_stream_with_reconnect(
             response,
@@ -560,6 +580,7 @@ where
             cancellation,
             idle_timeout,
             audit,
+            budget,
         ),
         _ => crate::stream::sse_stream_with_audit(
             response,
@@ -567,10 +588,12 @@ where
             cancellation,
             idle_timeout,
             audit,
+            budget,
         ),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_json(
     provider: &'static str,
     retry_provider: RetryProvider,
@@ -579,6 +602,7 @@ pub(crate) async fn send_json(
     attempt: u32,
     attempt_started: Instant,
     cancellation: Option<&CancellationToken>,
+    budget: &RequestBudget,
 ) -> Result<(Value, ResponseMetadata)> {
     let response = send_request(request, cancellation).await?;
     let metadata = ResponseMetadata::from_response(&response);
@@ -595,7 +619,7 @@ pub(crate) async fn send_json(
     let retry_directive = parse_retry_headers(retry_provider, response.headers());
     let retry_after = retry_directive.map(|directive| directive.delay);
     let retry_source = retry_directive.map(|directive| directive.source);
-    let text = read_response_text(response, cancellation).await?;
+    let text = read_response_text(response, cancellation, budget).await?;
     if let Some(audit) = audit {
         audit.add_response_bytes(text.len());
     }
@@ -634,21 +658,31 @@ async fn send_request(
 }
 
 async fn read_response_text(
-    response: reqwest::Response,
+    mut response: reqwest::Response,
     cancellation: Option<&CancellationToken>,
+    budget: &RequestBudget,
 ) -> Result<String> {
-    if let Some(cancellation) = cancellation {
-        if cancellation.is_cancelled() {
-            return Err(Error::Cancelled);
-        }
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => Err(Error::Cancelled),
-            text = response.text() => text.map_err(Error::from),
-        }
-    } else {
-        response.text().await.map_err(Error::from)
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = if let Some(token) = cancellation {
+            if token.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => return Err(Error::Cancelled),
+                chunk = response.chunk() => chunk.map_err(Error::from)?,
+            }
+        } else {
+            response.chunk().await.map_err(Error::from)?
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        budget.add_bytes(chunk.len())?;
+        bytes.extend_from_slice(&chunk);
     }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 async fn sleep_or_cancel(
@@ -697,73 +731,237 @@ pub(crate) async fn send_json_retry<F, Fut>(
     policy: &RetryPolicy,
     audit: Option<&AuditContext>,
     cancellation: Option<&CancellationToken>,
+    budget: &RequestBudget,
     mut make_request: F,
 ) -> Result<(Value, ResponseMetadata)>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<reqwest::RequestBuilder>>,
 {
-    if policy.max_attempts == 0 {
-        return Err(Error::InvalidRetryPolicy(
-            "max_attempts must be at least 1".to_string(),
-        ));
-    }
+    budget
+        .run(async {
+            if policy.max_attempts == 0 {
+                return Err(Error::InvalidRetryPolicy(
+                    "max_attempts must be at least 1".to_string(),
+                ));
+            }
 
-    for attempt in 0..policy.max_attempts {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return Err(Error::Cancelled);
-        }
-        if let Some(audit) = audit {
-            audit.attempt_started(attempt);
-        }
-        let attempt_started = Instant::now();
-        let request = match build_request_or_cancel(make_request(), cancellation).await {
-            Ok(request) => request,
-            Err(error) => {
-                if let Some(audit) = audit {
-                    audit.attempt_finished_with_request_id(
-                        attempt,
-                        attempt_started.elapsed(),
-                        None,
-                        None,
-                        Some(&error),
-                    );
+            for attempt in 0..policy.max_attempts {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return Err(Error::Cancelled);
                 }
-                let Some(delay) = next_delay(policy, attempt, &error) else {
-                    return Err(error);
+                if let Some(audit) = audit {
+                    audit.attempt_started(attempt);
+                }
+                let attempt_started = Instant::now();
+                let request = match build_request_or_cancel(make_request(), cancellation).await {
+                    Ok(request) => request,
+                    Err(error) => {
+                        if let Some(audit) = audit {
+                            audit.attempt_finished_with_request_id(
+                                attempt,
+                                attempt_started.elapsed(),
+                                None,
+                                None,
+                                Some(&error),
+                            );
+                        }
+                        let Some(delay) = next_delay(policy, attempt, &error) else {
+                            return Err(error);
+                        };
+                        if let Some(audit) = audit {
+                            audit.retry_scheduled(attempt, attempt + 1, delay, &error);
+                        }
+                        sleep_or_cancel(delay, cancellation).await?;
+                        continue;
+                    }
                 };
-                if let Some(audit) = audit {
-                    audit.retry_scheduled(attempt, attempt + 1, delay, &error);
-                }
-                sleep_or_cancel(delay, cancellation).await?;
-                continue;
-            }
-        };
 
-        match send_json(
-            provider,
-            retry_provider,
-            request,
-            audit,
-            attempt,
-            attempt_started,
-            cancellation,
-        )
+                match send_json(
+                    provider,
+                    retry_provider,
+                    request,
+                    audit,
+                    attempt,
+                    attempt_started,
+                    cancellation,
+                    budget,
+                )
+                .await
+                {
+                    Ok(response) => {
+                        if let Some(audit) = audit {
+                            audit.attempt_finished_with_request_id(
+                                attempt,
+                                attempt_started.elapsed(),
+                                Some(response.1.status),
+                                response.1.request_id.clone(),
+                                None,
+                            );
+                        }
+                        return Ok(response);
+                    }
+                    Err(error) => {
+                        if let Some(audit) = audit {
+                            audit.attempt_finished_with_request_id(
+                                attempt,
+                                attempt_started.elapsed(),
+                                error.status(),
+                                error.request_id().map(str::to_string),
+                                Some(&error),
+                            );
+                        }
+                        let Some(delay) = next_delay(policy, attempt, &error) else {
+                            return Err(error);
+                        };
+                        if let Some(audit) = audit {
+                            audit.retry_scheduled(attempt, attempt + 1, delay, &error);
+                        }
+                        sleep_or_cancel(delay, cancellation).await?;
+                    }
+                }
+            }
+
+            unreachable!("the loop returns on success or on the final error")
+        })
         .await
-        {
-            Ok(response) => {
+}
+
+pub(crate) async fn send_stream_retry<F, Fut>(
+    provider: &'static str,
+    retry_provider: RetryProvider,
+    policy: &RetryPolicy,
+    audit: Option<&AuditContext>,
+    cancellation: Option<&CancellationToken>,
+    budget: &RequestBudget,
+    mut make_request: F,
+) -> Result<reqwest::Response>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<reqwest::RequestBuilder>>,
+{
+    budget
+        .run(async {
+            if policy.max_attempts == 0 {
+                return Err(Error::InvalidRetryPolicy(
+                    "max_attempts must be at least 1".to_string(),
+                ));
+            }
+
+            for attempt in 0..policy.max_attempts {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return Err(Error::Cancelled);
+                }
                 if let Some(audit) = audit {
-                    audit.attempt_finished_with_request_id(
+                    audit.attempt_started(attempt);
+                }
+                let attempt_started = Instant::now();
+                let request = match build_request_or_cancel(make_request(), cancellation).await {
+                    Ok(request) => request,
+                    Err(error) => {
+                        if let Some(audit) = audit {
+                            audit.attempt_finished_with_request_id(
+                                attempt,
+                                attempt_started.elapsed(),
+                                None,
+                                None,
+                                Some(&error),
+                            );
+                        }
+                        let Some(delay) = next_delay(policy, attempt, &error) else {
+                            return Err(error);
+                        };
+                        if let Some(audit) = audit {
+                            audit.retry_scheduled(attempt, attempt + 1, delay, &error);
+                        }
+                        sleep_or_cancel(delay, cancellation).await?;
+                        continue;
+                    }
+                };
+
+                let response = match send_request(request, cancellation).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if let Some(audit) = audit {
+                            audit.attempt_finished_with_request_id(
+                                attempt,
+                                attempt_started.elapsed(),
+                                error.status(),
+                                None,
+                                Some(&error),
+                            );
+                        }
+                        let Some(delay) = next_delay(policy, attempt, &error) else {
+                            return Err(error);
+                        };
+                        if let Some(audit) = audit {
+                            audit.retry_scheduled(attempt, attempt + 1, delay, &error);
+                        }
+                        sleep_or_cancel(delay, cancellation).await?;
+                        continue;
+                    }
+                };
+
+                let status = response.status();
+                let metadata = ResponseMetadata::from_response(&response);
+                if let Some(audit) = audit {
+                    audit.response_headers(
                         attempt,
                         attempt_started.elapsed(),
-                        Some(response.1.status),
-                        response.1.request_id.clone(),
-                        None,
+                        status.as_u16(),
+                        metadata.request_id.clone(),
+                        status.is_success(),
                     );
                 }
-                return Ok(response);
-            }
-            Err(error) => {
+                if status.is_success() {
+                    if let Some(content_type) = response.headers().get(CONTENT_TYPE)
+                        && let Ok(content_type) = content_type.to_str()
+                        && !content_type
+                            .to_ascii_lowercase()
+                            .contains("text/event-stream")
+                    {
+                        let error = Error::StreamProtocol(format!(
+                            "{provider} returned {content_type}, expected text/event-stream"
+                        ));
+                        if let Some(audit) = audit {
+                            audit.attempt_finished_with_request_id(
+                                attempt,
+                                attempt_started.elapsed(),
+                                Some(status.as_u16()),
+                                metadata.request_id,
+                                Some(&error),
+                            );
+                        }
+                        return Err(error);
+                    }
+                    if let Some(audit) = audit {
+                        audit.attempt_finished_with_request_id(
+                            attempt,
+                            attempt_started.elapsed(),
+                            Some(status.as_u16()),
+                            metadata.request_id,
+                            None,
+                        );
+                    }
+                    return Ok(response);
+                }
+
+                let retry_directive = parse_retry_headers(retry_provider, response.headers());
+                let retry_after = retry_directive.map(|directive| directive.delay);
+                let retry_source = retry_directive.map(|directive| directive.source);
+                let request_id = ResponseMetadata::from_response(&response).request_id;
+                let body = read_response_text(response, cancellation, budget).await?;
+                if let Some(audit) = audit {
+                    audit.add_response_bytes(body.len());
+                }
+                let error = Error::Api {
+                    provider,
+                    status: status.as_u16(),
+                    body,
+                    retry_after,
+                    retry_source,
+                    request_id,
+                };
                 if let Some(audit) = audit {
                     audit.attempt_finished_with_request_id(
                         attempt,
@@ -773,6 +971,7 @@ where
                         Some(&error),
                     );
                 }
+
                 let Some(delay) = next_delay(policy, attempt, &error) else {
                     return Err(error);
                 };
@@ -781,164 +980,10 @@ where
                 }
                 sleep_or_cancel(delay, cancellation).await?;
             }
-        }
-    }
 
-    unreachable!("the loop returns on success or on the final error")
-}
-
-pub(crate) async fn send_stream_retry<F, Fut>(
-    provider: &'static str,
-    retry_provider: RetryProvider,
-    policy: &RetryPolicy,
-    audit: Option<&AuditContext>,
-    cancellation: Option<&CancellationToken>,
-    mut make_request: F,
-) -> Result<reqwest::Response>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<reqwest::RequestBuilder>>,
-{
-    if policy.max_attempts == 0 {
-        return Err(Error::InvalidRetryPolicy(
-            "max_attempts must be at least 1".to_string(),
-        ));
-    }
-
-    for attempt in 0..policy.max_attempts {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return Err(Error::Cancelled);
-        }
-        if let Some(audit) = audit {
-            audit.attempt_started(attempt);
-        }
-        let attempt_started = Instant::now();
-        let request = match build_request_or_cancel(make_request(), cancellation).await {
-            Ok(request) => request,
-            Err(error) => {
-                if let Some(audit) = audit {
-                    audit.attempt_finished_with_request_id(
-                        attempt,
-                        attempt_started.elapsed(),
-                        None,
-                        None,
-                        Some(&error),
-                    );
-                }
-                let Some(delay) = next_delay(policy, attempt, &error) else {
-                    return Err(error);
-                };
-                if let Some(audit) = audit {
-                    audit.retry_scheduled(attempt, attempt + 1, delay, &error);
-                }
-                sleep_or_cancel(delay, cancellation).await?;
-                continue;
-            }
-        };
-
-        let response = match send_request(request, cancellation).await {
-            Ok(response) => response,
-            Err(error) => {
-                if let Some(audit) = audit {
-                    audit.attempt_finished_with_request_id(
-                        attempt,
-                        attempt_started.elapsed(),
-                        error.status(),
-                        None,
-                        Some(&error),
-                    );
-                }
-                let Some(delay) = next_delay(policy, attempt, &error) else {
-                    return Err(error);
-                };
-                if let Some(audit) = audit {
-                    audit.retry_scheduled(attempt, attempt + 1, delay, &error);
-                }
-                sleep_or_cancel(delay, cancellation).await?;
-                continue;
-            }
-        };
-
-        let status = response.status();
-        let metadata = ResponseMetadata::from_response(&response);
-        if let Some(audit) = audit {
-            audit.response_headers(
-                attempt,
-                attempt_started.elapsed(),
-                status.as_u16(),
-                metadata.request_id.clone(),
-                status.is_success(),
-            );
-        }
-        if status.is_success() {
-            if let Some(content_type) = response.headers().get(CONTENT_TYPE)
-                && let Ok(content_type) = content_type.to_str()
-                && !content_type
-                    .to_ascii_lowercase()
-                    .contains("text/event-stream")
-            {
-                let error = Error::StreamProtocol(format!(
-                    "{provider} returned {content_type}, expected text/event-stream"
-                ));
-                if let Some(audit) = audit {
-                    audit.attempt_finished_with_request_id(
-                        attempt,
-                        attempt_started.elapsed(),
-                        Some(status.as_u16()),
-                        metadata.request_id,
-                        Some(&error),
-                    );
-                }
-                return Err(error);
-            }
-            if let Some(audit) = audit {
-                audit.attempt_finished_with_request_id(
-                    attempt,
-                    attempt_started.elapsed(),
-                    Some(status.as_u16()),
-                    metadata.request_id,
-                    None,
-                );
-            }
-            return Ok(response);
-        }
-
-        let retry_directive = parse_retry_headers(retry_provider, response.headers());
-        let retry_after = retry_directive.map(|directive| directive.delay);
-        let retry_source = retry_directive.map(|directive| directive.source);
-        let request_id = ResponseMetadata::from_response(&response).request_id;
-        let body = read_response_text(response, cancellation).await?;
-        if let Some(audit) = audit {
-            audit.add_response_bytes(body.len());
-        }
-        let error = Error::Api {
-            provider,
-            status: status.as_u16(),
-            body,
-            retry_after,
-            retry_source,
-            request_id,
-        };
-        if let Some(audit) = audit {
-            audit.attempt_finished_with_request_id(
-                attempt,
-                attempt_started.elapsed(),
-                error.status(),
-                error.request_id().map(str::to_string),
-                Some(&error),
-            );
-        }
-
-        let Some(delay) = next_delay(policy, attempt, &error) else {
-            return Err(error);
-        };
-        if let Some(audit) = audit {
-            audit.retry_scheduled(attempt, attempt + 1, delay, &error);
-        }
-        sleep_or_cancel(delay, cancellation).await?;
-    }
-
-    unreachable!("the loop returns on success or on the final error")
+            unreachable!("the loop returns on success or on the final error")
+        })
+        .await
 }
 
 /// Normalize a request with protocol defaults plus profile overrides.

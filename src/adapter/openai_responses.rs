@@ -1,3 +1,4 @@
+use crate::security::{RequestBudget, ResponseLimits};
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
@@ -55,7 +56,7 @@ impl OpenAIResponses {
             base_url: "https://api.openai.com/v1".to_string(),
             retry_policy: RetryPolicy::default(),
             transport: TransportConfig::default(),
-            client: reqwest::Client::new(),
+            client: super::secure_http_client(),
         }
     }
 
@@ -104,6 +105,7 @@ impl ModelAdapter for OpenAIResponses {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ChatResponse> {
+        let budget = RequestBudget::new(options)?;
         let transformed = apply_request_transform(request, options)?;
         let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
         let request = transformed.as_ref();
@@ -153,6 +155,7 @@ impl ModelAdapter for OpenAIResponses {
             &retry_policy,
             audit.as_ref(),
             options.cancellation.as_ref(),
+            &budget,
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -185,7 +188,10 @@ impl ModelAdapter for OpenAIResponses {
             }
         };
 
-        let mut response = match from_responses_response(value) {
+        let mut response = match from_responses_response(value).and_then(|response| {
+            budget.check_deadline()?;
+            Ok(response)
+        }) {
             Ok(response) => response,
             Err(error) => {
                 if let Some(audit) = &audit {
@@ -200,6 +206,9 @@ impl ModelAdapter for OpenAIResponses {
                 return Err(error);
             }
         };
+        if !budget.limits.retain_raw {
+            response.raw = serde_json::Value::Null;
+        }
         response.report = completion_report(
             Protocol::OpenAiResponses,
             request,
@@ -224,6 +233,7 @@ impl ModelAdapter for OpenAIResponses {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ModelStream> {
+        let budget = RequestBudget::new(options)?;
         let transformed = apply_request_transform(request, options)?;
         let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
         let request = transformed.as_ref();
@@ -276,6 +286,7 @@ impl ModelAdapter for OpenAIResponses {
             &retry_policy,
             audit.as_ref(),
             options.cancellation.as_ref(),
+            &budget,
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -318,6 +329,7 @@ impl ModelAdapter for OpenAIResponses {
         );
         let reconnect = options.stream_reconnect.map(|_| {
             ReconnectRequest::new(ReconnectRequestParts {
+                budget: budget.clone(),
                 provider: self.provider_name(),
                 client: self.client.clone(),
                 retry_policy: retry_policy.clone(),
@@ -339,6 +351,7 @@ impl ModelAdapter for OpenAIResponses {
             options.cancellation.clone(),
             options.idle_timeout,
             audit,
+            budget,
         ))
     }
 }
@@ -547,6 +560,7 @@ pub(crate) struct ResponsesStreamMapper {
     finish_reason: Option<String>,
     final_response: Option<ChatResponse>,
     chunks: Vec<Value>,
+    limits: ResponseLimits,
     report: CompletionReport,
 }
 
@@ -563,6 +577,7 @@ impl ResponsesStreamMapper {
             finish_reason: None,
             final_response: None,
             chunks: Vec::new(),
+            limits: ResponseLimits::default(),
             report: CompletionReport::default(),
         }
     }
@@ -681,6 +696,9 @@ impl ResponsesStreamMapper {
             normalized.message = Message::new(Role::Assistant, self.accumulated_parts());
         }
         normalized.metadata = Some(self.metadata.clone());
+        if !self.limits.retain_raw {
+            normalized.raw = Value::Null;
+        }
         normalized.report = self.report.clone();
         self.usage = normalized.usage.clone();
         self.finish_reason = response
@@ -782,7 +800,11 @@ impl ResponsesStreamMapper {
         let response = ChatResponse {
             message: Message::new(Role::Assistant, parts),
             usage: self.usage.clone(),
-            raw: Value::Array(self.chunks.clone()),
+            raw: if self.limits.retain_raw {
+                Value::Array(std::mem::take(&mut self.chunks))
+            } else {
+                Value::Null
+            },
             metadata: Some(self.metadata.clone()),
             report: self.report.clone(),
         };
@@ -795,13 +817,18 @@ impl ResponsesStreamMapper {
     }
 }
 impl SseMapper for ResponsesStreamMapper {
+    fn configure_limits(&mut self, limits: ResponseLimits) {
+        self.limits = limits;
+    }
     fn map(&mut self, message: SseMessage) -> Result<Vec<StreamEvent>> {
         if message.data.trim() == "[DONE]" {
             return self.finish_events();
         }
 
         let event: Value = serde_json::from_str(&message.data)?;
-        self.chunks.push(event.clone());
+        if self.limits.retain_raw {
+            self.chunks.push(event.clone());
+        }
         let event_type = event
             .get("type")
             .and_then(Value::as_str)

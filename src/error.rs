@@ -125,8 +125,8 @@ pub enum Error {
     MissingApiKey(String),
 
     /// The HTTP request to the provider failed at the transport level.
-    #[error("HTTP request failed: {0}")]
-    Http(#[from] reqwest::Error),
+    #[error("HTTP request failed")]
+    Http(#[source] reqwest::Error),
 
     /// The request was cancelled before it completed.
     #[error("request cancelled")]
@@ -145,8 +145,17 @@ pub enum Error {
     StreamProtocol(String),
 
     /// The provider reported an error inside a stream.
-    #[error("provider stream error: {0}")]
+    #[error("provider stream error (raw payload redacted)")]
     ProviderStream(String),
+
+    /// A decoded response exceeded its configured resource budget.
+    #[error("response exceeded {resource} limit of {limit}")]
+    ResponseLimit {
+        /// Name of the bounded resource, without provider content.
+        resource: &'static str,
+        /// Configured maximum.
+        limit: usize,
+    },
 
     #[error("{provider} returned HTTP {status}")]
     Api {
@@ -250,6 +259,12 @@ pub enum Error {
 
 struct RedactedBody(usize);
 
+impl From<reqwest::Error> for Error {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Http(error.without_url())
+    }
+}
+
 impl fmt::Debug for RedactedBody {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "<redacted {} bytes>", self.0)
@@ -262,7 +277,10 @@ impl fmt::Debug for Error {
             Self::MissingApiKey(value) => {
                 formatter.debug_tuple("MissingApiKey").field(value).finish()
             }
-            Self::Http(error) => formatter.debug_tuple("Http").field(error).finish(),
+            Self::Http(error) => formatter
+                .debug_struct("Http")
+                .field("kind", &classify_reqwest_error(error))
+                .finish(),
             Self::Cancelled => formatter.write_str("Cancelled"),
             Self::Timeout(message) => formatter.debug_tuple("Timeout").field(message).finish(),
             Self::Json(error) => formatter.debug_tuple("Json").field(error).finish(),
@@ -272,7 +290,12 @@ impl fmt::Debug for Error {
                 .finish(),
             Self::ProviderStream(value) => formatter
                 .debug_tuple("ProviderStream")
-                .field(value)
+                .field(&RedactedBody(value.len()))
+                .finish(),
+            Self::ResponseLimit { resource, limit } => formatter
+                .debug_struct("ResponseLimit")
+                .field("resource", resource)
+                .field("limit", limit)
                 .finish(),
             Self::Api {
                 provider,
@@ -358,6 +381,7 @@ impl Error {
             Self::Json(_) => ErrorKind::Decode,
             Self::StreamProtocol(_) => ErrorKind::StreamProtocol,
             Self::ProviderStream(value) => classify_provider_stream(value),
+            Self::ResponseLimit { .. } => ErrorKind::Decode,
             Self::Api { status, body, .. } => classify_api_error(*status, body),
             Self::MissingModel(_) => ErrorKind::Configuration,
             Self::InvalidRequest(_) => ErrorKind::InvalidRequest,
@@ -409,7 +433,7 @@ impl Error {
     /// logs and metrics.
     pub fn raw_body(&self) -> Option<&str> {
         match self {
-            Self::Api { body, .. } => Some(body),
+            Self::Api { body, .. } | Self::ProviderStream(body) => Some(body),
             _ => None,
         }
     }
@@ -417,7 +441,7 @@ impl Error {
     /// Decoded provider error-body size in bytes, without exposing the body.
     pub fn body_bytes(&self) -> Option<usize> {
         match self {
-            Self::Api { body, .. } => Some(body.len()),
+            Self::Api { body, .. } | Self::ProviderStream(body) => Some(body.len()),
             _ => None,
         }
     }
@@ -428,7 +452,7 @@ impl Error {
     /// are only returned when they are short, ASCII machine tokens.
     pub fn provider_error(&self) -> Option<ProviderErrorInfo> {
         match self {
-            Self::Api { body, .. } => Some(parse_provider_error(body)),
+            Self::Api { body, .. } | Self::ProviderStream(body) => Some(parse_provider_error(body)),
             _ => None,
         }
     }

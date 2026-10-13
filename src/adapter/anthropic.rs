@@ -1,3 +1,4 @@
+use crate::security::{RequestBudget, ResponseLimits};
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
@@ -58,7 +59,7 @@ impl AnthropicMessages {
             base_url: "https://api.anthropic.com/v1".to_string(),
             retry_policy: RetryPolicy::default(),
             transport: TransportConfig::default(),
-            client: reqwest::Client::new(),
+            client: super::secure_http_client(),
         }
     }
 
@@ -103,6 +104,7 @@ impl ModelAdapter for AnthropicMessages {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ChatResponse> {
+        let budget = RequestBudget::new(options)?;
         let transformed = apply_request_transform(request, options)?;
         let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
         let request = transformed.as_ref();
@@ -156,6 +158,7 @@ impl ModelAdapter for AnthropicMessages {
             &retry_policy,
             audit.as_ref(),
             options.cancellation.as_ref(),
+            &budget,
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -188,7 +191,10 @@ impl ModelAdapter for AnthropicMessages {
             }
         };
 
-        let mut response = match from_anthropic_response(value) {
+        let mut response = match from_anthropic_response(value).and_then(|response| {
+            budget.check_deadline()?;
+            Ok(response)
+        }) {
             Ok(response) => response,
             Err(error) => {
                 if let Some(audit) = &audit {
@@ -203,6 +209,9 @@ impl ModelAdapter for AnthropicMessages {
                 return Err(error);
             }
         };
+        if !budget.limits.retain_raw {
+            response.raw = serde_json::Value::Null;
+        }
         response.report = completion_report(
             Protocol::AnthropicMessages,
             request,
@@ -227,6 +236,7 @@ impl ModelAdapter for AnthropicMessages {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ModelStream> {
+        let budget = RequestBudget::new(options)?;
         let transformed = apply_request_transform(request, options)?;
         let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
         let request = transformed.as_ref();
@@ -283,6 +293,7 @@ impl ModelAdapter for AnthropicMessages {
             &retry_policy,
             audit.as_ref(),
             options.cancellation.as_ref(),
+            &budget,
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -325,6 +336,7 @@ impl ModelAdapter for AnthropicMessages {
         );
         let reconnect = options.stream_reconnect.map(|_| {
             ReconnectRequest::new(ReconnectRequestParts {
+                budget: budget.clone(),
                 provider: self.provider_name(),
                 client: self.client.clone(),
                 retry_policy: retry_policy.clone(),
@@ -346,6 +358,7 @@ impl ModelAdapter for AnthropicMessages {
             options.cancellation.clone(),
             options.idle_timeout,
             audit,
+            budget,
         ))
     }
 }
@@ -622,6 +635,7 @@ pub(crate) struct AnthropicStreamMapper {
     usage: Option<Usage>,
     finish_reason: Option<String>,
     chunks: Vec<Value>,
+    limits: ResponseLimits,
     report: CompletionReport,
 }
 
@@ -636,6 +650,7 @@ impl AnthropicStreamMapper {
             usage: None,
             finish_reason: None,
             chunks: Vec::new(),
+            limits: ResponseLimits::default(),
             report: CompletionReport::default(),
         }
     }
@@ -732,7 +747,11 @@ impl AnthropicStreamMapper {
         let response = ChatResponse {
             message: Message::new(Role::Assistant, parts),
             usage: self.usage.clone(),
-            raw: Value::Array(self.chunks.clone()),
+            raw: if self.limits.retain_raw {
+                Value::Array(std::mem::take(&mut self.chunks))
+            } else {
+                Value::Null
+            },
             metadata: Some(self.metadata.clone()),
             report: self.report.clone(),
         };
@@ -745,9 +764,14 @@ impl AnthropicStreamMapper {
 }
 
 impl SseMapper for AnthropicStreamMapper {
+    fn configure_limits(&mut self, limits: ResponseLimits) {
+        self.limits = limits;
+    }
     fn map(&mut self, message: SseMessage) -> Result<Vec<StreamEvent>> {
         let event: Value = serde_json::from_str(&message.data)?;
-        self.chunks.push(event.clone());
+        if self.limits.retain_raw {
+            self.chunks.push(event.clone());
+        }
         let event_type = event
             .get("type")
             .and_then(Value::as_str)

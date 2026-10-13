@@ -1,6 +1,7 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use futures_core::Stream;
 use crate::audit::{AuditContext, AuditOutcome, FirstTokenKind};
 use crate::cancel::CancellationToken;
 use crate::error::{Error, ErrorKind, Result};
+use crate::security::{RequestBudget, ResponseLimits};
 use crate::sse::{SseError, SseEvent, SseMessage, SseParser};
 use crate::types::{ChatResponse, ReasoningKind, ResponseMetadata, ServerToolState, Usage};
 
@@ -26,6 +28,11 @@ pub struct StreamReconnectPolicy {
     pub delay: Duration,
     /// Refuse reconnect when no SSE event id has been observed.
     pub require_event_id: bool,
+    /// Refuse reconnect delays above this cap (including server retry hints).
+    pub max_delay: Duration,
+    /// Suppress a replayed suffix only when the server guarantees replay semantics.
+    /// Off by default: inherited SSE IDs are not unique event identifiers.
+    pub deduplicate_replay: bool,
 }
 
 impl Default for StreamReconnectPolicy {
@@ -34,6 +41,8 @@ impl Default for StreamReconnectPolicy {
             max_attempts: 2,
             delay: Duration::from_millis(250),
             require_event_id: true,
+            max_delay: Duration::from_secs(60),
+            deduplicate_replay: false,
         }
     }
 }
@@ -60,6 +69,18 @@ impl StreamReconnectPolicy {
     /// Sets whether reconnecting requires an observed SSE event id.
     pub fn require_event_id(mut self, require_event_id: bool) -> Self {
         self.require_event_id = require_event_id;
+        self
+    }
+
+    /// Sets the maximum permitted reconnect delay.
+    pub fn max_delay(mut self, max_delay: Duration) -> Self {
+        self.max_delay = max_delay;
+        self
+    }
+
+    /// Enables suffix replay suppression for servers with documented resume semantics.
+    pub fn deduplicate_replay(mut self, enabled: bool) -> Self {
+        self.deduplicate_replay = enabled;
         self
     }
 }
@@ -135,6 +156,7 @@ pub struct StreamError {
 
 /// Provider-specific mapper from one SSE message to zero or more events.
 pub(crate) trait SseMapper: Send + Unpin + 'static {
+    fn configure_limits(&mut self, _limits: ResponseLimits) {}
     fn map(&mut self, message: SseMessage) -> Result<Vec<StreamEvent>>;
 
     /// Whether a clean EOF is a valid terminal condition for this protocol.
@@ -153,6 +175,7 @@ pub(crate) fn sse_stream_with_audit<M>(
     cancellation: Option<CancellationToken>,
     idle_timeout: Option<Duration>,
     audit: Option<AuditContext>,
+    budget: RequestBudget,
 ) -> ModelStream
 where
     M: SseMapper,
@@ -167,8 +190,10 @@ where
         finished: false,
         terminal: false,
         last_event_id: None,
-        seen_events: HashSet::new(),
-        seen_order: VecDeque::new(),
+        recent_events: VecDeque::new(),
+        recent_bytes: 0,
+        replay_events: None,
+        replay_started: false,
         reconnect: None,
         reconnect_future: None,
         cancellation,
@@ -179,6 +204,11 @@ where
         audit_finished: false,
         audit_status: Some(metadata.status),
         audit_provider_request_id: metadata.request_id,
+        total_deadline: budget
+            .deadline
+            .map(|deadline| Box::pin(tokio::time::sleep_until(deadline))),
+        budget,
+        event_count: 0,
     })
 }
 
@@ -219,6 +249,7 @@ struct ReconnectState {
     attempts: u32,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sse_stream_with_reconnect<M, F>(
     response: reqwest::Response,
     mapper: M,
@@ -227,6 +258,7 @@ pub(crate) fn sse_stream_with_reconnect<M, F>(
     cancellation: Option<CancellationToken>,
     idle_timeout: Option<Duration>,
     audit: Option<AuditContext>,
+    budget: RequestBudget,
 ) -> ModelStream
 where
     M: SseMapper,
@@ -242,8 +274,10 @@ where
         finished: false,
         terminal: false,
         last_event_id: None,
-        seen_events: HashSet::new(),
-        seen_order: VecDeque::new(),
+        recent_events: VecDeque::new(),
+        recent_bytes: 0,
+        replay_events: None,
+        replay_started: false,
         reconnect: Some(ReconnectState {
             factory: Box::new(factory),
             policy,
@@ -258,6 +292,11 @@ where
         audit_finished: false,
         audit_status: Some(metadata.status),
         audit_provider_request_id: metadata.request_id,
+        total_deadline: budget
+            .deadline
+            .map(|deadline| Box::pin(tokio::time::sleep_until(deadline))),
+        budget,
+        event_count: 0,
     })
 }
 
@@ -269,8 +308,10 @@ struct SseStream<M> {
     finished: bool,
     terminal: bool,
     last_event_id: Option<String>,
-    seen_events: HashSet<(String, String)>,
-    seen_order: VecDeque<(String, String)>,
+    recent_events: VecDeque<Arc<SseMessage>>,
+    recent_bytes: usize,
+    replay_events: Option<VecDeque<Arc<SseMessage>>>,
+    replay_started: bool,
     reconnect: Option<ReconnectState>,
     reconnect_future: Option<ReconnectFuture>,
     cancellation: Option<CancellationToken>,
@@ -281,9 +322,13 @@ struct SseStream<M> {
     audit_finished: bool,
     audit_status: Option<u16>,
     audit_provider_request_id: Option<String>,
+    budget: RequestBudget,
+    total_deadline: Option<IdleDeadline>,
+    event_count: usize,
 }
 
-const MAX_SEEN_EVENTS: usize = 4096;
+const MAX_REPLAY_BYTES: usize = 1024 * 1024;
+const MAX_REPLAY_EVENTS: usize = 4096;
 
 impl<M> SseStream<M>
 where
@@ -334,22 +379,30 @@ where
     }
 
     fn process_sse(&mut self, event: SseEvent) {
+        if self.finished || self.terminal {
+            return;
+        }
+        self.event_count += 1;
+        if self.event_count > self.budget.limits.max_stream_events {
+            self.fail(Error::ResponseLimit {
+                resource: "SSE events",
+                limit: self.budget.limits.max_stream_events,
+            });
+            return;
+        }
         match event {
             SseEvent::Retry(delay) => self.queue.push_back(Ok(StreamEvent::Retry { delay })),
             SseEvent::Message(message) => {
-                if let Some(id) = &message.id {
-                    self.last_event_id = Some(id.clone());
-                    let key = (id.clone(), message.data.clone());
-                    if self.seen_events.contains(&key) {
-                        return;
-                    }
-                    self.seen_events.insert(key.clone());
-                    self.seen_order.push_back(key);
-                    while self.seen_order.len() > MAX_SEEN_EVENTS {
-                        if let Some(oldest) = self.seen_order.pop_front() {
-                            self.seen_events.remove(&oldest);
-                        }
-                    }
+                self.last_event_id = message.id.clone().filter(|id| !id.is_empty());
+                if self.is_replayed(&message) {
+                    return;
+                }
+                if self
+                    .reconnect
+                    .as_ref()
+                    .is_some_and(|state| state.policy.deduplicate_replay)
+                {
+                    self.remember_event(&message);
                 }
 
                 match self.mapper.map(message) {
@@ -362,6 +415,61 @@ where
                 }
             }
         }
+    }
+
+    fn is_replayed(&mut self, message: &SseMessage) -> bool {
+        let Some(replay) = self.replay_events.as_mut() else {
+            return false;
+        };
+        if !self.replay_started {
+            if let Some(index) = replay.iter().position(|old| old.as_ref() == message) {
+                replay.drain(..index);
+                self.replay_started = true;
+            } else {
+                self.replay_events = None;
+                return false;
+            }
+        }
+        if replay.front().is_some_and(|old| old.as_ref() == message) {
+            replay.pop_front();
+            if replay.is_empty() {
+                self.replay_events = None;
+            }
+            true
+        } else {
+            self.replay_events = None;
+            false
+        }
+    }
+
+    fn remember_event(&mut self, message: &SseMessage) {
+        if message.id.as_ref().is_none_or(String::is_empty) {
+            return;
+        }
+        let bytes = message.data.len()
+            + message.id.as_ref().map_or(0, String::len)
+            + message.event.as_ref().map_or(0, String::len);
+        // An oversized event cannot participate in safe bounded replay matching.
+        if bytes > MAX_REPLAY_BYTES {
+            self.recent_events.clear();
+            self.recent_bytes = 0;
+            return;
+        }
+        self.recent_bytes += bytes;
+        self.recent_events.push_back(Arc::new(message.clone()));
+        while self.recent_bytes > MAX_REPLAY_BYTES || self.recent_events.len() > MAX_REPLAY_EVENTS {
+            if let Some(old) = self.recent_events.pop_front() {
+                self.recent_bytes -= old.data.len()
+                    + old.id.as_ref().map_or(0, String::len)
+                    + old.event.as_ref().map_or(0, String::len);
+            }
+        }
+    }
+
+    fn fail(&mut self, error: Error) {
+        self.finish_audit(Some(&error), None);
+        self.queue.push_back(Err(error));
+        self.finished = true;
     }
 
     fn process_sse_result(&mut self, result: std::result::Result<Vec<SseEvent>, SseError>) {
@@ -435,6 +543,13 @@ where
         let delay = delay_hint
             .or_else(|| self.parser.retry())
             .unwrap_or(reconnect.policy.delay);
+        if delay > reconnect.policy.max_delay {
+            return false;
+        }
+        if reconnect.policy.deduplicate_replay {
+            self.replay_events = Some(self.recent_events.clone());
+            self.replay_started = false;
+        }
         reconnect.attempts += 1;
         if let Some(audit) = &self.audit {
             audit.stream_reconnect_scheduled(reconnect.attempts, delay, last_event_id.is_some());
@@ -490,7 +605,7 @@ where
         if self.schedule_reconnect(None) {
             return;
         }
-        let error = Error::Http(error);
+        let error = Error::from(error);
         self.finish_audit(Some(&error), None);
         self.queue.push_back(Err(error));
         self.finished = true;
@@ -525,6 +640,27 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
+            if !this.finished && !this.terminal {
+                if this
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+                {
+                    this.queue.clear();
+                    this.cancel();
+                    continue;
+                }
+                if let Some(mut deadline) = this.total_deadline.take() {
+                    match deadline.as_mut().poll(cx) {
+                        Poll::Pending => this.total_deadline = Some(deadline),
+                        Poll::Ready(()) => {
+                            this.queue.clear();
+                            this.fail(Error::Timeout("total request deadline".into()));
+                            continue;
+                        }
+                    }
+                }
+            }
             if let Some(event) = this.queue.pop_front() {
                 return Poll::Ready(Some(event));
             }
@@ -593,6 +729,10 @@ where
                 Poll::Ready(Some(Ok(bytes))) => {
                     if let Some(audit) = &this.audit {
                         audit.add_response_bytes(bytes.len());
+                    }
+                    if let Err(error) = this.budget.add_bytes(bytes.len()) {
+                        this.fail(error);
+                        continue;
                     }
                     this.reset_idle_deadline();
                     let result = this.parser.push(&bytes);
@@ -680,8 +820,10 @@ mod tests {
             finished: false,
             terminal: false,
             last_event_id: None,
-            seen_events: HashSet::new(),
-            seen_order: VecDeque::new(),
+            recent_events: VecDeque::new(),
+            recent_bytes: 0,
+            replay_events: None,
+            replay_started: false,
             reconnect: None,
             reconnect_future: None,
             cancellation: None,
@@ -692,6 +834,9 @@ mod tests {
             audit_finished: false,
             audit_status: None,
             audit_provider_request_id: None,
+            budget: RequestBudget::new(&crate::RequestOptions::default()).unwrap(),
+            total_deadline: None,
+            event_count: 0,
         });
 
         let response = futures_executor::block_on(collect_stream(stream)).unwrap();

@@ -11,6 +11,9 @@
 
 ## 安装
 
+**0.4.0 安全修复版：** 本次收紧认证、工具配对、流重放、响应资源预算与总超时语义，
+升级 0.3.x 前请查看[迁移说明](docs/migration-0.4.md)和[变更记录](CHANGELOG.md)。
+
 ```bash
 cargo add mutil-ai
 ```
@@ -403,7 +406,7 @@ while let Some(event) = next_event(&mut stream).await {
 - 开始接收流之前的 HTTP 错误会按 `RetryPolicy` 重试。
 - 流开始后的 transport 断线可以显式启用 reconnect。
 - reconnect 必须看到 SSE `id`，会携带 `Last-Event-ID`，并复用同一个 mapper。
-- 已收到重复的 `(id, data)` 会被去重，避免重连后重复文本或工具参数。
+- 重放去重需要显式启用 `.deduplicate_replay(true)`，仅用于重连后的 replay suffix；普通连接保留合法重复事件，不能把继承的 SSE ID 当唯一序号。
 - 只有 Chat/Gemini 允许把 EOF 当正常结束；Responses/Anthropic 未看到终止事件时
   会把它视为可恢复断线。
 - `collect_stream` 可以忽略增量渲染，直接收集最终 `ChatResponse`。
@@ -1168,7 +1171,7 @@ examples/
 
 ## 12. 当前版本刻意不做的内容
 
-这是 v0.3.0,目前优先把 role、工具配对、retry、SSE、reasoning、统一
+这是 v0.4.0,目前优先把 role、工具配对、retry、SSE、reasoning、统一
 streaming、取消和通用 provider 扩展边界讲清楚，因此暂时不做：
 
 - WebSocket / Realtime

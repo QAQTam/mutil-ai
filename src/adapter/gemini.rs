@@ -1,3 +1,4 @@
+use crate::security::{RequestBudget, ResponseLimits};
 use async_trait::async_trait;
 use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
@@ -51,7 +52,7 @@ impl GeminiGenerateContent {
             base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
             retry_policy: RetryPolicy::default(),
             transport: TransportConfig::default(),
-            client: reqwest::Client::new(),
+            client: super::secure_http_client(),
         }
     }
 
@@ -96,6 +97,7 @@ impl ModelAdapter for GeminiGenerateContent {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ChatResponse> {
+        let budget = RequestBudget::new(options)?;
         let transformed = apply_request_transform(request, options)?;
         let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
         let request = transformed.as_ref();
@@ -144,6 +146,7 @@ impl ModelAdapter for GeminiGenerateContent {
             &retry_policy,
             audit.as_ref(),
             options.cancellation.as_ref(),
+            &budget,
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -181,7 +184,10 @@ impl ModelAdapter for GeminiGenerateContent {
             }
         };
 
-        let mut response = match from_gemini_response(value) {
+        let mut response = match from_gemini_response(value).and_then(|response| {
+            budget.check_deadline()?;
+            Ok(response)
+        }) {
             Ok(response) => response,
             Err(error) => {
                 if let Some(audit) = &audit {
@@ -196,6 +202,9 @@ impl ModelAdapter for GeminiGenerateContent {
                 return Err(error);
             }
         };
+        if !budget.limits.retain_raw {
+            response.raw = serde_json::Value::Null;
+        }
         response.report = completion_report(
             Protocol::GeminiGenerateContent,
             request,
@@ -220,6 +229,7 @@ impl ModelAdapter for GeminiGenerateContent {
         request: &ChatRequest,
         options: &RequestOptions,
     ) -> Result<ModelStream> {
+        let budget = RequestBudget::new(options)?;
         let transformed = apply_request_transform(request, options)?;
         let transform_applied = matches!(transformed, std::borrow::Cow::Owned(_));
         let request = transformed.as_ref();
@@ -278,6 +288,7 @@ impl ModelAdapter for GeminiGenerateContent {
             &retry_policy,
             audit.as_ref(),
             options.cancellation.as_ref(),
+            &budget,
             || async {
                 let headers = prepare_headers(&self.transport, &base_headers, options).await?;
                 let mut request_builder = self
@@ -319,6 +330,7 @@ impl ModelAdapter for GeminiGenerateContent {
             ));
         let reconnect = options.stream_reconnect.map(|_| {
             ReconnectRequest::new(ReconnectRequestParts {
+                budget: budget.clone(),
                 provider: self.provider_name(),
                 client: self.client.clone(),
                 retry_policy: retry_policy.clone(),
@@ -340,6 +352,7 @@ impl ModelAdapter for GeminiGenerateContent {
             options.cancellation.clone(),
             options.idle_timeout,
             audit,
+            budget,
         ))
     }
 }
@@ -662,6 +675,7 @@ pub(crate) struct GeminiStreamMapper {
     usage: Option<Usage>,
     finish_reason: Option<String>,
     chunks: Vec<Value>,
+    limits: ResponseLimits,
     report: CompletionReport,
 }
 
@@ -677,6 +691,7 @@ impl GeminiStreamMapper {
             usage: None,
             finish_reason: None,
             chunks: Vec::new(),
+            limits: ResponseLimits::default(),
             report: CompletionReport::default(),
         }
     }
@@ -787,7 +802,11 @@ impl GeminiStreamMapper {
         let response = ChatResponse {
             message: Message::new(Role::Assistant, parts),
             usage: self.usage.clone(),
-            raw: Value::Array(self.chunks.clone()),
+            raw: if self.limits.retain_raw {
+                Value::Array(std::mem::take(&mut self.chunks))
+            } else {
+                Value::Null
+            },
             metadata: Some(self.metadata.clone()),
             report: self.report.clone(),
         };
@@ -800,12 +819,17 @@ impl GeminiStreamMapper {
 }
 
 impl SseMapper for GeminiStreamMapper {
+    fn configure_limits(&mut self, limits: ResponseLimits) {
+        self.limits = limits;
+    }
     fn map(&mut self, message: SseMessage) -> Result<Vec<StreamEvent>> {
         let chunk: Value = serde_json::from_str(&message.data)?;
         if let Some(error) = chunk.get("error") {
             return Err(Error::ProviderStream(error.to_string()));
         }
-        self.chunks.push(chunk.clone());
+        if self.limits.retain_raw {
+            self.chunks.push(chunk.clone());
+        }
 
         let mut events = Vec::new();
         self.push_start(&mut events);

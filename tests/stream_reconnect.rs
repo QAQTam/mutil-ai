@@ -117,6 +117,7 @@ async fn stream_reconnect_reuses_mapper_and_deduplicates_last_event() {
         .idempotency_key("idem-reconnect")
         .stream_reconnect(
             StreamReconnectPolicy::new()
+                .deduplicate_replay(true)
                 .max_attempts(1)
                 .delay(Duration::ZERO),
         );

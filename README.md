@@ -11,6 +11,10 @@ A provider-neutral model-invocation SDK for Rust beginners.
 
 ## Installation
 
+**0.4.0 security release:** this version tightens authentication, tool pairing,
+stream replay, response budgets and total timeout behavior. See the
+[migration guide](docs/migration-0.4.md) and [changelog](CHANGELOG.md) before upgrading from 0.3.x.
+
 ```bash
 cargo add mutil-ai
 ```
@@ -392,7 +396,7 @@ Current boundaries:
 - HTTP errors before the stream starts receiving are retried according to `RetryPolicy`.
 - Transport disconnections after the stream starts can be handled with explicitly enabled reconnect.
 - Reconnect requires seeing an SSE `id`, sends `Last-Event-ID`, and reuses the same mapper.
-- Duplicate `(id, data)` pairs already received are deduplicated, avoiding repeated text or tool arguments after a reconnect.
+- Replay suppression is opt-in with `.deduplicate_replay(true)` and only applies to a reconnected replay suffix. Ordinary connections preserve repeated events and inherited SSE IDs.
 - Only Chat/Gemini treat EOF as a normal end; Responses/Anthropic treat an EOF without a terminal event as a recoverable disconnect.
 - `collect_stream` lets you skip incremental rendering and simply collect the final `ChatResponse`.
 
@@ -1116,7 +1120,7 @@ Key point: **role conversion, tool repairs, and cross-provider reasoning cleanup
 
 ## 12. What the current version deliberately does not do
 
-This is v0.3.0; the current priority is getting roles, tool pairing, retry, SSE, reasoning, unified streaming, cancellation, and the generic provider extension boundary clearly defined. For now, the following are out of scope:
+This is v0.4.0; the current priority is getting roles, tool pairing, retry, SSE, reasoning, unified streaming, cancellation, and the generic provider extension boundary clearly defined. For now, the following are out of scope:
 
 - WebSocket / Realtime
 - OpenAI Responses' `previous_response_id` / `store`
