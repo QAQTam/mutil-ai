@@ -7,7 +7,7 @@
 [![CI](https://github.com/QAQTam/mutil-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/QAQTam/mutil-ai/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/mutil-ai.svg)](https://crates.io/crates/mutil-ai)
 [![docs.rs](https://docs.rs/mutil-ai/badge.svg)](https://docs.rs/mutil-ai)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 
 ## 安装
 
@@ -20,7 +20,7 @@ cargo add mutil-ai
 
 - 最低 Rust 版本(MSRV):**1.97.1**(见 `Cargo.toml` 的 `rust-version`)
 - 可选 feature:`blocking`(提供阻塞式 `BlockingAdapter` / `BlockingStream`)
-- 许可:MIT
+- 许可:MIT OR Apache-2.0（任选一种）
 
 
 它的目标不是一次支持所有高级功能，而是先回答一个关键问题：
@@ -1183,6 +1183,23 @@ streaming、取消和通用 provider 扩展边界讲清楚，因此暂时不做�
 
 这些以后都可以加，但应该加在明确的位置，而不是把 provider 特例塞进下游
 runtime 或示例 Agent 循环。
+
+## 许可证
+
+本项目代码与文档采用 [MIT](LICENSE-MIT) 或
+[Apache License 2.0](LICENSE-APACHE) 双许可，由使用者任选一种
+（`MIT OR Apache-2.0`，不是必须同时遵守两份许可证）。两种许可均允许商业使用、
+修改和分发，包括用于闭源产品，但须遵守所选许可证的条件。分发时应保留要求的
+许可证与署名声明；选择 Apache-2.0 时，还须为修改过的文件添加修改声明。
+第三方依赖仍适用各自的许可证。
+
+mutil-ai 是独立的非官方 SDK。本项目许可不授予模型服务访问权，也不代表
+OpenAI、Anthropic、Google 或其他模型厂商的授权、赞助或背书。
+实际 API 调用仍须遵守对应厂商的服务条款、使用政策及账号与访问要求；
+SDK 的开源许可不能覆盖服务转售、竞争产品或绕过访问控制等限制。参见适用的
+[OpenAI](https://openai.com/policies/services-agreement/)、
+[Anthropic](https://www.anthropic.com/legal/commercial-terms) 和
+[Gemini API](https://ai.google.dev/gemini-api/terms) 服务条款。
 
 ## 贡献者
 

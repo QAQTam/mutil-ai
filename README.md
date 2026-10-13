@@ -7,7 +7,7 @@ A provider-neutral model-invocation SDK for Rust beginners.
 [![CI](https://github.com/QAQTam/mutil-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/QAQTam/mutil-ai/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/mutil-ai.svg)](https://crates.io/crates/mutil-ai)
 [![docs.rs](https://docs.rs/mutil-ai/badge.svg)](https://docs.rs/mutil-ai)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 
 ## Installation
 
@@ -21,7 +21,7 @@ cargo add mutil-ai
 
 - Minimum supported Rust version (MSRV): **1.97.1** (see `rust-version` in `Cargo.toml`)
 - Optional feature: `blocking` (provides the blocking `BlockingAdapter` / `BlockingStream`)
-- License: MIT
+- License: MIT OR Apache-2.0 (choose either)
 
 
 Its goal is not to support every advanced feature at once, but to answer one key question first:
@@ -1130,6 +1130,27 @@ This is v0.4.0; the current priority is getting roles, tool pairing, retry, SSE,
 - Automatically translating reasoning between different providers; the current choice is to safely drop it rather than guess
 
 All of these can be added later — but they should be added in clearly defined places, not by stuffing provider special cases into the downstream runtime or the example Agent loop.
+
+## License
+
+This project's code and documentation are dual-licensed under the
+[MIT License](LICENSE-MIT) or [Apache License, Version 2.0](LICENSE-APACHE),
+at your option (`MIT OR Apache-2.0`, not a requirement to comply with both).
+Either license permits commercial use, modification, and distribution,
+including use in closed-source products, subject to the chosen license's
+conditions. Keep the required license and attribution notices when distributing;
+Apache-2.0 also requires notices for modified files. Third-party dependencies
+retain their own licenses.
+
+mutil-ai is an independent, unofficial SDK. Its license does not grant access to
+model-provider services or imply authorization, sponsorship, or endorsement by
+OpenAI, Anthropic, Google, or other providers. API use remains subject to the
+provider's applicable terms, usage policies, and account/access requirements;
+SDK licensing does not override restrictions on service resale, competing
+products, or bypassing access controls. See the applicable
+[OpenAI](https://openai.com/policies/services-agreement/),
+[Anthropic](https://www.anthropic.com/legal/commercial-terms), and
+[Gemini API](https://ai.google.dev/gemini-api/terms) terms.
 
 ## Contributors
 

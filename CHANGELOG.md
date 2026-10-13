@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Add Apache-2.0 as an alternative to the existing MIT license (`MIT OR Apache-2.0`).
+- Include both license texts and clarify commercial use and the separate model-provider terms.
+- No Rust API or runtime behavior changes; the published 0.4.0 package and tag remain unchanged.
+
 ## 0.4.0 — Security hardening
 
 ### Breaking/source and behavior changes
