@@ -1183,3 +1183,8 @@ streaming、取消和通用 provider 扩展边界讲清楚，因此暂时不做�
 
 这些以后都可以加，但应该加在明确的位置，而不是把 provider 特例塞进下游
 runtime 或示例 Agent 循环。
+
+## 贡献者
+
+- [QAQTam](https://github.com/QAQTam) — 项目维护者。
+- [OpenAI Codex](https://developers.openai.com/codex/) — AI 辅助贡献：v0.4.0 安全审计、安全修复、依赖核查与发布准备。

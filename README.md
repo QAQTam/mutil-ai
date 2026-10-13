@@ -1130,3 +1130,8 @@ This is v0.4.0; the current priority is getting roles, tool pairing, retry, SSE,
 - Automatically translating reasoning between different providers; the current choice is to safely drop it rather than guess
 
 All of these can be added later — but they should be added in clearly defined places, not by stuffing provider special cases into the downstream runtime or the example Agent loop.
+
+## Contributors
+
+- [QAQTam](https://github.com/QAQTam) — project maintainer.
+- [OpenAI Codex](https://developers.openai.com/codex/) — AI-assisted contributions to the v0.4.0 security audit, hardening, dependency review, and release preparation.
