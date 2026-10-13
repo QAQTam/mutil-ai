@@ -11,6 +11,8 @@
 
 ## 安装
 
+**0.4.1：** 新增 Apache-2.0 可选许可，保留 MIT；无 API 或运行行为变化。
+
 **0.4.0 安全修复版：** 本次收紧认证、工具配对、流重放、响应资源预算与总超时语义，
 升级 0.3.x 前请查看[迁移说明](docs/migration-0.4.md)和[变更记录](CHANGELOG.md)。
 
@@ -1171,7 +1173,7 @@ examples/
 
 ## 12. 当前版本刻意不做的内容
 
-这是 v0.4.0,目前优先把 role、工具配对、retry、SSE、reasoning、统一
+这是 v0.4.1,目前优先把 role、工具配对、retry、SSE、reasoning、统一
 streaming、取消和通用 provider 扩展边界讲清楚，因此暂时不做：
 
 - WebSocket / Realtime

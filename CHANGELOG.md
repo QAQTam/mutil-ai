@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.1 — Dual licensing
 
 - Add Apache-2.0 as an alternative to the existing MIT license (`MIT OR Apache-2.0`).
 - Include both license texts and clarify commercial use and the separate model-provider terms.

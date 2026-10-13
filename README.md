@@ -11,6 +11,8 @@ A provider-neutral model-invocation SDK for Rust beginners.
 
 ## Installation
 
+**0.4.1:** adds Apache-2.0 as an alternative to MIT, with no API or runtime changes.
+
 **0.4.0 security release:** this version tightens authentication, tool pairing,
 stream replay, response budgets and total timeout behavior. See the
 [migration guide](docs/migration-0.4.md) and [changelog](CHANGELOG.md) before upgrading from 0.3.x.
@@ -1120,7 +1122,7 @@ Key point: **role conversion, tool repairs, and cross-provider reasoning cleanup
 
 ## 12. What the current version deliberately does not do
 
-This is v0.4.0; the current priority is getting roles, tool pairing, retry, SSE, reasoning, unified streaming, cancellation, and the generic provider extension boundary clearly defined. For now, the following are out of scope:
+This is v0.4.1; the current priority is getting roles, tool pairing, retry, SSE, reasoning, unified streaming, cancellation, and the generic provider extension boundary clearly defined. For now, the following are out of scope:
 
 - WebSocket / Realtime
 - OpenAI Responses' `previous_response_id` / `store`
