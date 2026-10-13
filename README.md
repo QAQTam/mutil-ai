@@ -11,6 +11,10 @@ A provider-neutral model-invocation SDK for Rust beginners.
 
 ## Installation
 
+**0.5.1:** `tool_call_content` modes no longer drop non-empty assistant content
+next to `tool_calls` — they only shape empty content, as documented. See
+[CHANGELOG.md](CHANGELOG.md).
+
 **0.5.0:** fixes tool-result pairing, so a correct call id with a differing tool
 name no longer drops real tool output. See [docs/migration-0.5.md](docs/migration-0.5.md).
 

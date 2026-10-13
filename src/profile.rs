@@ -414,6 +414,12 @@ impl ProfileRegistry {
 }
 
 /// How an assistant tool-call message should encode empty content.
+///
+/// These modes only canonicalize content that is absent, `null`, or an empty
+/// string. Non-empty assistant text is real transcript data and is **always
+/// preserved verbatim** — stripping it would blind the model to its own prior
+/// narration. Consumers that genuinely need to drop non-empty content must use
+/// `RequestOptions::request_transform`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ToolCallContentMode {
     /// Preserve the adapter's documented default.

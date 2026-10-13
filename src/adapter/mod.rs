@@ -362,8 +362,33 @@ pub(crate) fn apply_provider_request_options(
         && let Some(mode) = options.tool_call_content
         && let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut)
     {
-        for message in messages {
+        // Tripwire: 非空 content 是真实转录数据，任何模式下都不得被改写。
+        // 0.5.0 曾无条件清空（消费方模型"失忆"五个月），此断言保证回归即炸。
+        let non_empty_before: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.get("tool_calls").is_some_and(Value::is_array))
+            .filter(|(_, m)| {
+                matches!(m.get("content"), Some(Value::String(s)) if !s.is_empty())
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for message in messages.iter_mut() {
             if !message.get("tool_calls").is_some_and(Value::is_array) {
+                continue;
+            }
+            // Only shape EMPTY content. Non-empty assistant text next to
+            // tool_calls is real transcript data: clobbering it here silently
+            // blinded consumers' models (qaqh-backend regression, fixed
+            // 2026-10-14 — the model lost its own previous narration and kept
+            // re-deriving context in its reasoning). Consumers that truly need
+            // to strip non-empty content must use `request_transform`.
+            let content_empty = match message.get("content") {
+                None | Some(Value::Null) => true,
+                Some(Value::String(s)) => s.is_empty(),
+                _ => false,
+            };
+            if !content_empty {
                 continue;
             }
             match mode {
@@ -379,6 +404,22 @@ pub(crate) fn apply_provider_request_options(
                 ToolCallContentMode::Empty => {
                     message["content"] = Value::String(String::new());
                 }
+            }
+        }
+        for i in non_empty_before {
+            let preserved = matches!(
+                messages[i].get("content"),
+                Some(Value::String(s)) if !s.is_empty()
+            );
+            if !preserved {
+                eprintln!(
+                    "[mutil-ai][WIRE-LOSS] tool_call_content mode={mode:?} altered non-empty \
+                     assistant content (message #{i}) — transcript data loss regression"
+                );
+                debug_assert!(
+                    false,
+                    "tool_call_content clobbered non-empty assistant content"
+                );
             }
         }
     }
@@ -1009,3 +1050,119 @@ pub(crate) fn normalize_for_protocol(
     }
     crate::normalize::normalize_with_options(request, options)
 }
+
+#[cfg(test)]
+mod tool_call_content_tests {
+    //! 回归：`ToolCallContentMode` 只允许整形**空** content。
+    //! 0.5.0 及之前会把带 tool_calls 的 assistant 消息的非空 content
+    //! 一并清掉（Null 置 null / Omit 删键 / Empty 置空串），导致消费方
+    //! 模型看不到自己历史轮的可见文本。
+
+    use super::apply_provider_request_options;
+    use crate::normalize::Protocol;
+    use crate::profile::{ProviderRequestOptions, ToolCallContentMode};
+    use serde_json::{Value, json};
+
+    fn sample_body() -> Value {
+        json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": "ACK-TEXT",
+                    "tool_calls": [{"id": "c1", "type": "function",
+                        "function": {"name": "read", "arguments": "{}"}}]
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [{"id": "c2", "type": "function",
+                        "function": {"name": "read", "arguments": "{}"}}]
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn non_empty_content_is_never_clobbered() {
+        for mode in [
+            ToolCallContentMode::Auto,
+            ToolCallContentMode::Null,
+            ToolCallContentMode::Omit,
+            ToolCallContentMode::Empty,
+        ] {
+            let mut body = sample_body();
+            apply_provider_request_options(
+                &mut body,
+                Protocol::OpenAiChat,
+                &ProviderRequestOptions {
+                    tool_call_content: Some(mode),
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+            let assistant = &body["messages"][1];
+            assert_eq!(
+                assistant["content"], "ACK-TEXT",
+                "mode {mode:?} clobbered non-empty content"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_content_is_shaped_per_mode() {
+        for (mode, expect_present, expect_value) in [
+            (ToolCallContentMode::Auto, false, Value::Null),
+            (ToolCallContentMode::Null, true, Value::Null),
+            (ToolCallContentMode::Omit, false, Value::Null),
+            (ToolCallContentMode::Empty, true, json!("")),
+        ] {
+            let mut body = sample_body();
+            apply_provider_request_options(
+                &mut body,
+                Protocol::OpenAiChat,
+                &ProviderRequestOptions {
+                    tool_call_content: Some(mode),
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+            let assistant = &body["messages"][3];
+            assert_eq!(
+                assistant.get("content").is_some(),
+                expect_present,
+                "mode {mode:?} content presence"
+            );
+            if expect_present {
+                assert_eq!(assistant["content"], expect_value, "mode {mode:?} value");
+            }
+        }
+    }
+
+    #[test]
+    fn messages_without_tool_calls_are_untouched() {
+        for mode in [
+            ToolCallContentMode::Null,
+            ToolCallContentMode::Omit,
+            ToolCallContentMode::Empty,
+        ] {
+            let mut body = sample_body();
+            apply_provider_request_options(
+                &mut body,
+                Protocol::OpenAiChat,
+                &ProviderRequestOptions {
+                    tool_call_content: Some(mode),
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+            assert_eq!(body["messages"][0]["content"], "hi");
+            assert_eq!(body["messages"][2]["content"], "ok");
+        }
+    }
+}
+

@@ -11,6 +11,8 @@
 
 ## 安装
 
+**0.5.1：** `tool_call_content` 各模式不再丢弃 `tool_calls` 旁的非空 assistant 文本——只按文档承诺整形空 content。见 [CHANGELOG.md](CHANGELOG.md)。
+
 **0.5.0：** 修正工具配对：call id 正确但工具名不一致时，不再丢弃真实工具输出。见 [docs/migration-0.5.md](docs/migration-0.5.md)。
 
 **0.4.1：** 新增 Apache-2.0 可选许可，保留 MIT；无 API 或运行行为变化。

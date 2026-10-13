@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.1 — `tool_call_content` no longer clobbers non-empty content
+
+### Behavior fix
+
+- `ToolCallContentMode::Null` / `Omit` / `Empty` now canonicalize only content
+  that is absent, `null`, or an empty string. Non-empty assistant text next to
+  `tool_calls` is real transcript data and is preserved verbatim in every mode
+  (the documented contract; 0.2.1–0.5.0 silently dropped it, blinding consumers'
+  models to their own previous narration). Consumers that genuinely need to
+  strip non-empty content must use `RequestOptions::request_transform`.
+- A tripwire logs `[mutil-ai][WIRE-LOSS]` and asserts if a non-empty content is
+  ever altered by these modes again.
+- No API changes; source-compatible with 0.5.0.
+
 ## 0.5.0 — Tool-pairing identity fixes
 
 ### Breaking/source changes
