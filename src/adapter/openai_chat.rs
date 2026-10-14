@@ -1442,6 +1442,7 @@ fn openai_chat_reasoning_effort(config: Option<&ReasoningConfig>) -> Option<&'st
             crate::types::ReasoningEffort::High => "high",
             crate::types::ReasoningEffort::XHigh => "xhigh",
             crate::types::ReasoningEffort::Max => "max",
+            crate::types::ReasoningEffort::Ultra => "ultra",
         });
     }
 
@@ -1659,6 +1660,21 @@ mod tests {
         let (normalized, _) = normalize(&request, Protocol::OpenAiChat).unwrap();
         let body = to_openai_chat_body("gpt-5", &normalized, &request, None).unwrap();
         assert_eq!(body["reasoning_effort"], "xhigh");
+    }
+
+    /// 0.6.0：`ultra` 是 `ReasoningEffort` 的最高档（Codex 桌面端的档位表里
+    /// `xhigh` 之上那一档）。序列化值与线上值都必须是 `"ultra"`。
+    #[test]
+    fn ultra_reasoning_effort_is_sent() {
+        assert_eq!(
+            serde_json::to_value(crate::types::ReasoningEffort::Ultra).unwrap(),
+            json!("ultra")
+        );
+        let request = ChatRequest::user("hi")
+            .reasoning(ReasoningConfig::new().effort(crate::types::ReasoningEffort::Ultra));
+        let (normalized, _) = normalize(&request, Protocol::OpenAiChat).unwrap();
+        let body = to_openai_chat_body("gpt-5", &normalized, &request, None).unwrap();
+        assert_eq!(body["reasoning_effort"], "ultra");
     }
 
     #[test]

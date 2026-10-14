@@ -1248,6 +1248,7 @@ fn responses_reasoning(config: Option<&ReasoningConfig>) -> Option<Value> {
                 crate::types::ReasoningEffort::High => "high",
                 crate::types::ReasoningEffort::XHigh => "xhigh",
                 crate::types::ReasoningEffort::Max => "max",
+                crate::types::ReasoningEffort::Ultra => "ultra",
             }),
         );
     } else if config.mode == Some(ReasoningMode::Disabled) {

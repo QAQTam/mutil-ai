@@ -630,7 +630,7 @@ fn gemini_thinking(config: Option<&ReasoningConfig>) -> Option<Value> {
                     ReasoningEffort::Minimal => "MINIMAL",
                     ReasoningEffort::Low => "LOW",
                     ReasoningEffort::Medium => "MEDIUM",
-                    ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max => "HIGH",
+                    ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max | ReasoningEffort::Ultra => "HIGH",
                 }),
             );
         }

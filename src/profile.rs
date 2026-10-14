@@ -927,6 +927,8 @@ pub struct EffortMapping {
     pub xhigh: Option<String>,
     /// Provider value for the neutral `max` effort; `None` means unsupported.
     pub max: Option<String>,
+    /// Provider value for the neutral `ultra` effort; `None` means unsupported.
+    pub ultra: Option<String>,
 }
 
 impl EffortMapping {
@@ -940,6 +942,7 @@ impl EffortMapping {
             high: Some("high".to_string()),
             xhigh: Some("xhigh".to_string()),
             max: Some("max".to_string()),
+            ultra: Some("ultra".to_string()),
         }
     }
 
@@ -953,6 +956,9 @@ impl EffortMapping {
             high: Some("high".to_string()),
             xhigh: Some("high".to_string()),
             max: Some("max".to_string()),
+            // DeepSeek 没有比 `max` 更高的档:取它的顶,而不是丢掉这个请求
+            // (`None` = 不支持 → 调用方不发 effort,等于回退到 provider 缺省)。
+            ultra: Some("max".to_string()),
         }
     }
 
@@ -977,6 +983,7 @@ impl EffortMapping {
             crate::types::ReasoningEffort::High => self.high.as_deref(),
             crate::types::ReasoningEffort::XHigh => self.xhigh.as_deref(),
             crate::types::ReasoningEffort::Max => self.max.as_deref(),
+            crate::types::ReasoningEffort::Ultra => self.ultra.as_deref(),
         }
     }
 }

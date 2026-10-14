@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.0 — `ultra` reasoning tier
+
+### Breaking/source changes
+
+- `ReasoningEffort` adds `Ultra` (wire value `ultra`), above `Max`. The enum is
+  exhaustive, so downstream matches must add an arm.
+- `EffortMapping` adds the `ultra` field. Struct literals built without
+  `..Self::default()` must add it.
+
+### Behavior
+
+- OpenAI Responses and Chat send `reasoning_effort: "ultra"` verbatim.
+- The built-in mappings treat `ultra` as "as high as this provider goes":
+  `identity` → `ultra`; `deepseek` → `max` (DeepSeek has nothing above `max`,
+  and dropping the request entirely would silently fall back to the provider
+  default); Gemini collapses it into `HIGH` next to `xhigh`/`max`. Providers
+  with no entry map it to unsupported (`None`), like any other level.
+- The tier is gated upstream — not every account is offered it — so requesting
+  it is only meaningful where the provider accepts it.
+
 ## 0.5.1 — `tool_call_content` no longer clobbers non-empty content
 
 ### Behavior fix

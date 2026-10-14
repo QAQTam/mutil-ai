@@ -771,6 +771,9 @@ pub enum ReasoningEffort {
     XHigh,
     /// The provider's maximum reasoning tier.
     Max,
+    /// Above `max`: OpenAI 的 `ultra`（Codex 桌面端暴露的最高档，上游受门控）。
+    /// `snake_case` 直接给出 `"ultra"`，无需显式 rename。
+    Ultra,
 }
 
 /// How much reasoning detail the provider should expose.
