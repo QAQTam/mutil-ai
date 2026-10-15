@@ -66,7 +66,7 @@ pub use retry::{
     parse_retry_after_at, parse_retry_headers, parse_retry_headers_at, retry_async,
 };
 pub use security::ResponseLimits;
-pub use sse::{SseError, SseEvent, SseMessage, SseParser, SseUtf8Policy};
+pub use sse::{SseError, SseEvent, SseMessage, SseParser, SseUtf8Policy, TailPolicy};
 pub use stream::{
     ModelStream, StreamError, StreamEvent, StreamReconnectPolicy, collect_stream, next_event,
 };

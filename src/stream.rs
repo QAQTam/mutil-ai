@@ -164,6 +164,12 @@ pub(crate) trait SseMapper: Send + Unpin + 'static {
         true
     }
 
+    /// The SSE parser used by [`SseStream`] for this protocol. Adapters may
+    /// override it to opt into e.g. [`crate::sse::TailPolicy::Flush`].
+    fn sse_parser(&self) -> SseParser {
+        SseParser::new()
+    }
+
     fn finish(&mut self) -> Result<Vec<StreamEvent>> {
         Ok(Vec::new())
     }
@@ -184,7 +190,7 @@ where
     let cancellation_future = cancellation_future(cancellation.clone());
     Box::pin(SseStream {
         inner: Box::pin(response.bytes_stream()),
-        parser: SseParser::new(),
+        parser: mapper.sse_parser(),
         mapper,
         queue: VecDeque::new(),
         finished: false,
@@ -268,7 +274,7 @@ where
     let cancellation_future = cancellation_future(cancellation.clone());
     Box::pin(SseStream {
         inner: Box::pin(response.bytes_stream()),
-        parser: SseParser::new(),
+        parser: mapper.sse_parser(),
         mapper,
         queue: VecDeque::new(),
         finished: false,

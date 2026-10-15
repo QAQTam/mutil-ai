@@ -1033,6 +1033,16 @@ impl SseMapper for OpenAiChatStreamMapper {
     fn configure_limits(&mut self, limits: ResponseLimits) {
         self.limits = limits;
     }
+
+    fn sse_parser(&self) -> crate::sse::SseParser {
+        // Lenient gateways routinely cut the connection right after the
+        // final tool-call argument delta, without the blank-line SSE
+        // terminator. The discard default loses that frame; Flush recovers
+        // it, and a genuinely truncated payload surfaces as a parse error
+        // instead of silent loss.
+        crate::sse::SseParser::new().with_tail_policy(crate::sse::TailPolicy::Flush)
+    }
+
     fn map(&mut self, message: SseMessage) -> Result<Vec<StreamEvent>> {
         if message.data.trim() == "[DONE]" {
             return Ok(self.done_events());

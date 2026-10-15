@@ -36,6 +36,22 @@ pub enum SseUtf8Policy {
     Strict,
 }
 
+/// How an incomplete trailing event is handled by [`SseParser::finish`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TailPolicy {
+    /// WHATWG EventSource behavior: discard the incomplete final event.
+    #[default]
+    Discard,
+    /// Flush the trailing event. Lenient LLM gateways routinely end a stream
+    /// right after the final `data:` line — without the blank-line
+    /// terminator, with a bare trailing CR, or mid-line. Discarding that
+    /// frame silently loses bytes (typically the tail of a tool-call
+    /// arguments JSON); Flush dispatches whatever arrived instead, so a
+    /// genuinely truncated payload surfaces as a mapper/JSON error rather
+    /// than silent loss.
+    Flush,
+}
+
 /// Errors that can occur while parsing an SSE stream.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SseError {
@@ -55,8 +71,9 @@ pub enum SseError {
 /// Incremental, zero-I/O SSE parser.
 ///
 /// Feed arbitrary byte chunks with [`SseParser::push`]. It does not assume
-/// chunks end on lines or events. A final incomplete event is discarded by
-/// [`SseParser::finish`], matching the usual EventSource behavior.
+/// chunks end on lines or events. By default a final incomplete event is
+/// discarded by [`SseParser::finish`], matching the usual EventSource
+/// behavior; [`TailPolicy::Flush`] recovers it instead.
 pub struct SseParser {
     line: Vec<u8>,
     pending_cr: bool,
@@ -72,6 +89,7 @@ pub struct SseParser {
     max_line_bytes: usize,
     max_event_bytes: usize,
     utf8_policy: SseUtf8Policy,
+    tail_policy: TailPolicy,
 }
 
 impl Default for SseParser {
@@ -109,6 +127,7 @@ impl SseParser {
             max_line_bytes,
             max_event_bytes,
             utf8_policy: SseUtf8Policy::Replace,
+            tail_policy: TailPolicy::Discard,
         }
     }
 
@@ -116,6 +135,18 @@ impl SseParser {
     pub fn with_utf8_policy(mut self, utf8_policy: SseUtf8Policy) -> Self {
         self.utf8_policy = utf8_policy;
         self
+    }
+
+    /// Sets how the incomplete final event is handled by
+    /// [`SseParser::finish`].
+    pub fn with_tail_policy(mut self, tail_policy: TailPolicy) -> Self {
+        self.tail_policy = tail_policy;
+        self
+    }
+
+    /// Returns the configured tail policy.
+    pub fn tail_policy(&self) -> TailPolicy {
+        self.tail_policy
     }
 
     /// Start a reconnected parser from the last event id seen on the previous
@@ -214,17 +245,33 @@ impl SseParser {
             }
         }
 
-        if self.pending_cr {
+        if self.tail_policy == TailPolicy::Discard {
+            // A non-empty line without a following blank line is an
+            // incomplete event. EventSource implementations discard it at
+            // EOF.
+            self.line.clear();
+            self.event_type = None;
+            self.data.clear();
             self.pending_cr = false;
+            return Ok(());
         }
 
-        // A non-empty line without a following blank line is an incomplete
-        // event. EventSource implementations discard it at EOF.
-        self.line.clear();
-        self.event_type = None;
-        self.data.clear();
-        self.pending_cr = false;
-
+        // TailPolicy::Flush: recover the trailing event instead of
+        // discarding it.
+        if self.pending_cr {
+            // A trailing bare CR terminates the buffered line (if any).
+            self.pending_cr = false;
+            self.end_line(events)?;
+        }
+        if !self.line.is_empty() {
+            let line = std::mem::take(&mut self.line);
+            self.process_line(&line, events)?;
+        }
+        if self.data.is_empty() {
+            self.event_type = None;
+        } else {
+            self.dispatch(events);
+        }
         Ok(())
     }
 
@@ -561,6 +608,48 @@ mod tests {
         let events = parser.push(b"data: incomplete").unwrap();
         assert!(events.is_empty());
         assert!(parser.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn flush_policy_dispatches_final_data_line_without_blank_terminator() {
+        let mut parser = SseParser::new().with_tail_policy(TailPolicy::Flush);
+        let mut events = parser.push(b"data: {\"q\":1}").unwrap();
+        assert!(events.is_empty());
+        parser.finish_into(&mut events).unwrap();
+        assert_eq!(events, vec![message("{\"q\":1}")]);
+    }
+
+    #[test]
+    fn flush_policy_flushes_aggregated_multi_data_tail() {
+        let mut parser = SseParser::new().with_tail_policy(TailPolicy::Flush);
+        let mut events = parser.push(b"data: A\ndata: B").unwrap();
+        parser.finish_into(&mut events).unwrap();
+        assert_eq!(events, vec![message("A\nB")]);
+    }
+
+    #[test]
+    fn flush_policy_treats_trailing_bare_cr_as_terminator() {
+        let mut parser = SseParser::new().with_tail_policy(TailPolicy::Flush);
+        let mut events = parser.push(b"data: hi\r").unwrap();
+        parser.finish_into(&mut events).unwrap();
+        assert_eq!(events, vec![message("hi")]);
+    }
+
+    #[test]
+    fn flush_policy_ignores_partial_unknown_field_tail() {
+        let mut parser = SseParser::new().with_tail_policy(TailPolicy::Flush);
+        let mut events = parser.push(b"data: hi\neven").unwrap();
+        parser.finish_into(&mut events).unwrap();
+        assert_eq!(events, vec![message("hi")]);
+    }
+
+    #[test]
+    fn flush_policy_without_pending_data_is_a_noop() {
+        let mut parser = SseParser::new().with_tail_policy(TailPolicy::Flush);
+        let events = parser.push(b"data: done\n\n").unwrap();
+        assert_eq!(events, vec![message("done")]);
+        let extra = parser.finish().unwrap();
+        assert!(extra.is_empty());
     }
 
     #[test]

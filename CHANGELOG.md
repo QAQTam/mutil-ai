@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.1 — SSE tail flush (recover the final event on gateway-cut streams)
+
+### Added
+
+- `SseParser::with_tail_policy(TailPolicy)` with `TailPolicy::Discard` (default,
+  unchanged spec behavior) and `TailPolicy::Flush`. Under `Flush`,
+  `finish`/`finish_into` dispatch the trailing event instead of discarding it:
+  a final `data:` line missing only the blank-line terminator, an aggregated
+  multi-`data:` tail, a trailing bare CR as line terminator, and a buffered
+  partial line (interpreted as a field; genuinely truncated payloads then
+  surface as mapper/JSON errors instead of silent byte loss).
+- `SseMapper::sse_parser` hook so adapters choose their parser configuration.
+  `OpenAiChatStreamMapper` opts into `Flush`: lenient gateways routinely cut
+  the connection right after the final tool-call argument delta, and the
+  discard default turned that into a truncated `arguments` JSON downstream.
+
 ## 0.6.0 — `ultra` reasoning tier
 
 ### Breaking/source changes
