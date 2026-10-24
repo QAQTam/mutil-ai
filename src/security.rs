@@ -12,6 +12,10 @@ pub struct ResponseLimits {
     pub max_body_bytes: usize,
     /// Maximum SSE messages and retry fields, including replayed events.
     pub max_stream_events: usize,
+    /// Maximum bytes in a single SSE line, independent of the total body cap.
+    pub max_sse_line_bytes: usize,
+    /// Maximum data bytes in a single SSE event.
+    pub max_sse_event_bytes: usize,
     /// Retain raw provider JSON in the response. Disable to reduce memory use.
     pub retain_raw: bool,
     /// Maximum accumulated arguments for one OpenAI Chat tool call.
@@ -26,6 +30,8 @@ impl Default for ResponseLimits {
         Self {
             max_body_bytes: 16 * 1024 * 1024,
             max_stream_events: 16_384,
+            max_sse_line_bytes: crate::sse::DEFAULT_MAX_LINE_BYTES,
+            max_sse_event_bytes: crate::sse::DEFAULT_MAX_EVENT_BYTES,
             retain_raw: true,
             max_tool_argument_bytes: 1024 * 1024,
             tool_progress_interval_bytes: 4096,
@@ -45,6 +51,8 @@ impl RequestBudget {
         let limits = options.response_limits;
         if limits.max_body_bytes == 0
             || limits.max_stream_events == 0
+            || limits.max_sse_line_bytes == 0
+            || limits.max_sse_event_bytes == 0
             || limits.max_tool_argument_bytes == 0
             || limits.tool_progress_interval_bytes == 0
         {

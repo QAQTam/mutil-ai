@@ -42,13 +42,9 @@ pub enum Part {
     /// Model reasoning content.
     Reasoning(Reasoning),
     /// Image referenced by URL.
-    ImageUrl {
-        image_url: ImageUrl,
-    },
+    ImageUrl { image_url: ImageUrl },
     /// Image passed inline as base64 data or a file reference.
-    Image {
-        image: ImagePart,
-    },
+    Image { image: ImagePart },
     /// A tool call requested by the model.
     ToolCall(ToolCall),
     /// A tool result sent back to the model.
@@ -738,6 +734,12 @@ pub struct ToolSpec {
     pub description: String,
     /// JSON Schema describing the tool's arguments.
     pub parameters: serde_json::Value,
+    /// Opt in to provider-side structured-output schema enforcement. Responses
+    /// always sends this switch explicitly: omission can cause the endpoint to
+    /// make optional, non-nullable arguments required. This does not control the
+    /// application's argument validation. Schemas are never rewritten here.
+    #[serde(default)]
+    pub strict: bool,
 }
 
 impl ToolSpec {
@@ -751,7 +753,14 @@ impl ToolSpec {
             name: name.into(),
             description: description.into(),
             parameters,
+            strict: false,
         }
+    }
+
+    /// Use a provider-compatible strict schema supplied by the caller.
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 }
 

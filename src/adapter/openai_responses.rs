@@ -446,6 +446,7 @@ pub(crate) fn to_responses_body(
                 "name": tool.name,
                 "description": tool.description,
                 "parameters": tool.parameters,
+                "strict": tool.strict,
             })
         })
         .collect::<Vec<_>>();
@@ -1358,6 +1359,34 @@ mod tests {
 
     use super::*;
     use crate::normalize::{Protocol, normalize};
+
+    #[test]
+    fn optional_tool_arguments_are_not_implicitly_made_required() {
+        let schema = json!({"type":"object", "properties": {
+            "path":{"type":"string"}, "image_index":{"type":"integer"}
+        }, "additionalProperties":false});
+        let request = ChatRequest::user("inspect").tools([crate::types::ToolSpec::new(
+            "read_image",
+            "inspect image",
+            schema.clone(),
+        )]);
+        let (normalized, _) = normalize(&request, Protocol::OpenAiResponses).unwrap();
+        let body = to_responses_body("m", &normalized, &request);
+        assert_eq!(body["tools"][0]["strict"], false);
+        assert_eq!(body["tools"][0]["parameters"], schema);
+    }
+
+    #[test]
+    fn caller_can_enable_strict_schema_without_schema_rewriting() {
+        let schema = json!({"type":"object","properties":{"path":{"type":["string","null"]}},"required":["path"],"additionalProperties":false});
+        let request = ChatRequest::user("inspect").tools([
+            crate::types::ToolSpec::new("image", "inspect", schema.clone()).strict(true)
+        ]);
+        let (normalized, _) = normalize(&request, Protocol::OpenAiResponses).unwrap();
+        let body = to_responses_body("m", &normalized, &request);
+        assert_eq!(body["tools"][0]["strict"], true);
+        assert_eq!(body["tools"][0]["parameters"], schema);
+    }
 
     #[test]
     fn neutral_request_controls_map_to_responses() {

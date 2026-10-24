@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-const DEFAULT_MAX_LINE_BYTES: usize = 64 * 1024;
-const DEFAULT_MAX_EVENT_BYTES: usize = 1024 * 1024;
+pub(crate) const DEFAULT_MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
 const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
 /// A parsed SSE message.
@@ -99,7 +99,7 @@ impl Default for SseParser {
 }
 
 impl SseParser {
-    /// Creates a parser with default limits: 64 KiB per line and 1 MiB per
+    /// Creates a parser with default limits: 4 MiB per line and 16 MiB per
     /// event, using [`SseUtf8Policy::Replace`].
     pub fn new() -> Self {
         Self::with_limits(DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_EVENT_BYTES)
@@ -129,6 +129,13 @@ impl SseParser {
             utf8_policy: SseUtf8Policy::Replace,
             tail_policy: TailPolicy::Discard,
         }
+    }
+
+    /// Sets how invalid UTF-8 in field values is handled.
+    pub(crate) fn with_byte_limits(mut self, line: usize, event: usize) -> Self {
+        self.max_line_bytes = line;
+        self.max_event_bytes = event;
+        self
     }
 
     /// Sets how invalid UTF-8 in field values is handled.
@@ -659,6 +666,13 @@ mod tests {
             parser.push(b"data: hello\n\n"),
             Err(SseError::LineTooLong { limit: 4 })
         );
+    }
+
+    #[test]
+    fn default_parser_accepts_large_responses_terminal_lines() {
+        let mut parser = SseParser::new();
+        let payload = format!("data: {}\n\n", "x".repeat(128 * 1024));
+        assert!(parser.push(payload.as_bytes()).is_ok());
     }
 
     #[test]

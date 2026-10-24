@@ -190,7 +190,10 @@ where
     let cancellation_future = cancellation_future(cancellation.clone());
     Box::pin(SseStream {
         inner: Box::pin(response.bytes_stream()),
-        parser: mapper.sse_parser(),
+        parser: mapper.sse_parser().with_byte_limits(
+            budget.limits.max_sse_line_bytes,
+            budget.limits.max_sse_event_bytes,
+        ),
         mapper,
         queue: VecDeque::new(),
         finished: false,
@@ -274,7 +277,10 @@ where
     let cancellation_future = cancellation_future(cancellation.clone());
     Box::pin(SseStream {
         inner: Box::pin(response.bytes_stream()),
-        parser: mapper.sse_parser(),
+        parser: mapper.sse_parser().with_byte_limits(
+            budget.limits.max_sse_line_bytes,
+            budget.limits.max_sse_event_bytes,
+        ),
         mapper,
         queue: VecDeque::new(),
         finished: false,
