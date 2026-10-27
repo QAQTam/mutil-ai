@@ -7,7 +7,7 @@ async fn request_with_limits(line: usize, event: usize, body_limit: usize) -> mu
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut buffer = [0;8192];
-        socket.read(&mut buffer).await.unwrap();
+        let _ = socket.read(&mut buffer).await.unwrap();
         let text = "x".repeat(128 * 1024);
         let item = serde_json::json!({"type":"response.completed","response":{"id":"r1","status":"completed","model":"test","output":[{"id":"m1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text,"annotations":[]}]}]}});
         let body = format!("data: {item}\n\n");

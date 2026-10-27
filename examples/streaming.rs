@@ -44,6 +44,12 @@ async fn main() -> mutil_ai::Result<()> {
             StreamEvent::ServerToolStatus { tool, state, .. } => {
                 println!("[server tool {tool}] {state:?}");
             }
+            StreamEvent::NativeToolProgress { index, .. } => {
+                println!("[native tool {index}] receiving input");
+            }
+            StreamEvent::NativeToolCompleted { index, call } => {
+                println!("[native tool {index}] completed: {}", call.name);
+            }
             StreamEvent::Usage { usage } => {
                 println!("usage: {usage:?}");
             }

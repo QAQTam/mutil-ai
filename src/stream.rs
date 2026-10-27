@@ -13,7 +13,9 @@ use crate::cancel::CancellationToken;
 use crate::error::{Error, ErrorKind, Result};
 use crate::security::{RequestBudget, ResponseLimits};
 use crate::sse::{SseError, SseEvent, SseMessage, SseParser};
-use crate::types::{ChatResponse, ReasoningKind, ResponseMetadata, ServerToolState, Usage};
+use crate::types::{
+    ChatResponse, NativeToolCall, ReasoningKind, ResponseMetadata, ServerToolState, Usage,
+};
 
 /// A boxed provider-neutral stream of model events.
 pub type ModelStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send + 'static>>;
@@ -114,6 +116,15 @@ pub enum StreamEvent {
         name: Option<String>,
         arguments_so_far: String,
     },
+    /// Raw custom input progress. This event is not proof of completion.
+    NativeToolProgress {
+        index: usize,
+        item_id: Option<String>,
+        input_so_far: String,
+    },
+    /// A completed native item. Applications must still apply cancellation and
+    /// response-level scheduling policy before executing a write.
+    NativeToolCompleted { index: usize, call: NativeToolCall },
     /// A provider-hosted or built-in tool changed state.
     ServerToolStatus {
         tool: String,

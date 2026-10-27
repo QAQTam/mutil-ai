@@ -47,6 +47,8 @@ pub enum Part {
     Image { image: ImagePart },
     /// A tool call requested by the model.
     ToolCall(ToolCall),
+    /// A Responses native client-tool call with its original identity and input.
+    NativeToolCall(NativeToolCall),
     /// A tool result sent back to the model.
     ToolResult(ToolResult),
     /// A provider-hosted tool item such as web-search output.
@@ -764,6 +766,181 @@ impl ToolSpec {
     }
 }
 
+/// Input accepted by a client-executed custom tool.
+///
+/// Native declarations remain gated until call and replay support is complete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CustomToolFormat {
+    /// Unconstrained raw text.
+    Text,
+    /// Raw text constrained by a provider-supported grammar.
+    Grammar {
+        /// Grammar syntax identifier, such as `lark`.
+        syntax: String,
+        /// Complete grammar definition supplied by the caller.
+        definition: String,
+    },
+}
+
+/// A client-executed tool within a declaration scope.
+///
+/// Unlike [`ServerTool`], custom tools are executed by the application. This
+/// Native declarations remain gated until streaming and replay are complete.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ScopedToolDeclaration {
+    /// A JSON-arguments function, including the legacy function definition.
+    Function { tool: ToolSpec },
+    /// A raw-text client tool.
+    Custom {
+        name: String,
+        description: String,
+        format: CustomToolFormat,
+    },
+}
+
+impl ScopedToolDeclaration {
+    /// Name exposed within the containing scope.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Function { tool } => &tool.name,
+            Self::Custom { name, .. } => name,
+        }
+    }
+}
+
+impl From<ToolSpec> for ScopedToolDeclaration {
+    fn from(tool: ToolSpec) -> Self {
+        Self::Function { tool }
+    }
+}
+
+/// A flat client tool or a single-level namespace of client tools.
+///
+/// Requests containing these declarations are currently rejected until native
+/// call decoding and result replay can be supported safely.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolDeclaration {
+    /// A tool in the top-level scope.
+    Tool { tool: ScopedToolDeclaration },
+    /// A named scope; nested namespaces cannot be represented.
+    Namespace {
+        name: String,
+        description: String,
+        tools: Vec<ScopedToolDeclaration>,
+    },
+}
+
+/// Reject duplicate names within each declaration scope, regardless of kind.
+///
+/// A namespace occupies a name in the top-level scope. Empty names are also
+/// rejected. Provider-specific naming and capability rules remain separate.
+pub fn validate_tool_declarations(declarations: &[ToolDeclaration]) -> crate::Result<()> {
+    fn insert<'a>(
+        names: &mut std::collections::HashSet<&'a str>,
+        name: &'a str,
+    ) -> crate::Result<()> {
+        if name.is_empty() || !names.insert(name) {
+            return Err(crate::Error::InvalidRequest(format!(
+                "tool_declaration_conflict: empty or duplicate name `{name}`"
+            )));
+        }
+        Ok(())
+    }
+
+    let mut top_level = std::collections::HashSet::new();
+    for declaration in declarations {
+        match declaration {
+            ToolDeclaration::Tool { tool } => insert(&mut top_level, tool.name())?,
+            ToolDeclaration::Namespace { name, tools, .. } => {
+                insert(&mut top_level, name)?;
+                let mut scoped = std::collections::HashSet::new();
+                for tool in tools {
+                    insert(&mut scoped, tool.name())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The original wire representation of a client-executed tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeToolKind {
+    Function,
+    Custom,
+}
+
+/// Raw input, kept separate from application-specific canonical arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum NativeToolPayload {
+    /// Unparsed JSON argument text as received on the wire.
+    JsonArguments(String),
+    /// Unmodified free-form input.
+    RawText(String),
+}
+
+/// Whether the protocol has reliably finished delivering a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeToolCompletion {
+    Receiving,
+    Completed,
+    Invalid,
+    Interrupted,
+}
+
+/// Original call identity and input, independent of a canonical tool call.
+///
+/// This is not yet integrated with message normalization or stream decoding;
+/// consumers must not treat the presence of this type as execution support.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NativeToolCall {
+    pub kind: NativeToolKind,
+    pub namespace: Option<String>,
+    pub name: String,
+    /// The provider's real result-pairing identifier, never the item id.
+    pub call_id: String,
+    /// The output item's identifier, when supplied by the provider.
+    pub item_id: Option<String>,
+    pub payload: NativeToolPayload,
+    pub completion: NativeToolCompletion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_state: Option<ProviderState>,
+}
+
+impl NativeToolCall {
+    /// Check identity and payload invariants before admitting a completed call.
+    pub fn validate_completed(&self) -> crate::Result<()> {
+        if self.completion != NativeToolCompletion::Completed {
+            return Err(crate::Error::InvalidRequest("tool_call_incomplete".into()));
+        }
+        if self.call_id.is_empty()
+            || self.name.is_empty()
+            || self.namespace.as_deref() == Some("")
+            || self.item_id.as_deref() == Some("")
+        {
+            return Err(crate::Error::InvalidRequest(
+                "tool_identity_conflict".into(),
+            ));
+        }
+        if !matches!(
+            (&self.kind, &self.payload),
+            (
+                NativeToolKind::Function,
+                NativeToolPayload::JsonArguments(_)
+            ) | (NativeToolKind::Custom, NativeToolPayload::RawText(_))
+        ) {
+            return Err(crate::Error::InvalidRequest("tool_payload_conflict".into()));
+        }
+        Ok(())
+    }
+}
+
 /// A provider-neutral reasoning-effort level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -917,6 +1094,10 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     /// Client-side tools the model may call.
     pub tools: Vec<ToolSpec>,
+    /// Native client declarations. Currently rejected by all wire adapters;
+    /// this gate prevents exposing tools before call/result replay is complete.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_declarations: Vec<ToolDeclaration>,
     /// Provider-hosted tools such as web search.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub server_tools: Vec<ServerTool>,
@@ -963,6 +1144,13 @@ impl ChatRequest {
     /// Replaces the client-side tool list.
     pub fn tools(mut self, tools: impl IntoIterator<Item = ToolSpec>) -> Self {
         self.tools = tools.into_iter().collect();
+        self
+    }
+
+    /// Replaces the native client declarations; the legacy function list is
+    /// retained separately and participates in top-level conflict validation.
+    pub fn tool_declarations(mut self, tools: impl IntoIterator<Item = ToolDeclaration>) -> Self {
+        self.tool_declarations = tools.into_iter().collect();
         self
     }
 

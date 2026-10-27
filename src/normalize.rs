@@ -394,15 +394,15 @@ struct PendingCall {
     /// stored assistant tool call carried no id. Such ids cannot match a result
     /// that keeps a real provider id, so they accept a name-based fallback.
     synthetic: bool,
+    native: bool,
 }
 
 /// Normalize a request using the default rules for a protocol.
 ///
 /// # Errors
 ///
-/// Returns an error if the [`OrphanToolResultPolicy::Error`] or
-/// [`MissingToolResultPolicy::Error`] policy is triggered. The default
-/// rules never do, so this cannot fail in practice.
+/// Returns an error for invalid histories, unsupported tool representations,
+/// or when a configured tool-result policy rejects a malformed history.
 pub fn normalize(
     request: &ChatRequest,
     protocol: Protocol,
@@ -426,6 +426,33 @@ pub fn normalize_with_options(
     request: &ChatRequest,
     options: NormalizeOptions,
 ) -> Result<(NormalizedChat, NormalizeReport)> {
+    if request.messages.iter().any(|message| {
+        message.role != Role::Assistant
+            && message
+                .parts
+                .iter()
+                .any(|part| matches!(part, Part::NativeToolCall(_)))
+    }) {
+        return Err(Error::Normalize(
+            "tool_identity_conflict: native calls require assistant role".into(),
+        ));
+    }
+    if !request.tool_declarations.is_empty() {
+        let mut declarations: Vec<_> = request
+            .tools
+            .iter()
+            .cloned()
+            .map(|tool| crate::types::ToolDeclaration::Tool { tool: tool.into() })
+            .collect();
+        declarations.extend(request.tool_declarations.iter().cloned());
+        crate::types::validate_tool_declarations(&declarations)?;
+        if options.protocol != Protocol::OpenAiResponses {
+            return Err(Error::Unsupported(format!(
+                "unsupported_tool_representation: native tool declarations require Responses, got {:?}",
+                options.protocol
+            )));
+        }
+    }
     let expected_reasoning_format = options.protocol.provider_state_format();
     let occupied_call_ids = request
         .messages
@@ -433,6 +460,7 @@ pub fn normalize_with_options(
         .flat_map(|message| &message.parts)
         .filter_map(|part| match part {
             Part::ToolCall(call) => call.id.clone(),
+            Part::NativeToolCall(call) => Some(call.call_id.clone()),
             _ => None,
         })
         .collect();
@@ -445,6 +473,7 @@ pub fn normalize_with_options(
         next_call_id: 1,
         occupied_call_ids,
         seen_call_ids: std::collections::HashSet::new(),
+        seen_native_ids: std::collections::HashSet::new(),
         expected_reasoning_format,
         top_taken: false,
     };
@@ -474,6 +503,7 @@ struct Normalizer {
     next_call_id: u64,
     occupied_call_ids: std::collections::HashSet<String>,
     seen_call_ids: std::collections::HashSet<String>,
+    seen_native_ids: std::collections::HashSet<String>,
     expected_reasoning_format: ProviderStateFormat,
     /// True once a system message has claimed the top-level slot under
     /// `SystemPlacement::FirstToTopRestInPlace`.
@@ -653,14 +683,52 @@ impl Normalizer {
                         message_index: usize::MAX,
                         fulfilled: false,
                         synthetic: synthetic_id,
+                        native: false,
                     });
                     parts.push(Part::ToolCall(call));
+                }
+                Part::NativeToolCall(call) => {
+                    if self.options.protocol != Protocol::OpenAiResponses {
+                        return Err(Error::Unsupported("unsupported_tool_representation: native tool history requires Responses".into()));
+                    }
+                    call.validate_completed()?;
+                    if !self.seen_call_ids.insert(call.call_id.clone()) {
+                        return Err(Error::Normalize(
+                            "tool_identity_conflict: duplicate call_id".into(),
+                        ));
+                    }
+                    self.seen_native_ids.insert(call.call_id.clone());
+                    self.pending_calls.push(PendingCall {
+                        id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        message_index: usize::MAX,
+                        fulfilled: false,
+                        synthetic: false,
+                        native: true,
+                    });
+                    parts.push(part.clone());
                 }
                 Part::ToolResult(result) => {
                     // A result inside an assistant message is malformed.
                     self.handle_orphan_tool_result(result)?;
                 }
                 Part::ProviderItem(item) => {
+                    if item.provider_state.format == ProviderStateFormat::OpenAiResponses
+                        && matches!(
+                            item.provider_state
+                                .data
+                                .get("type")
+                                .and_then(serde_json::Value::as_str),
+                            Some(
+                                "custom_tool_call"
+                                    | "function_call"
+                                    | "custom_tool_call_output"
+                                    | "function_call_output"
+                            )
+                        )
+                    {
+                        return Err(Error::Normalize("unsupported_tool_representation: client tool calls and results must use typed parts".into()));
+                    }
                     if self.options.preserve_foreign_reasoning
                         || item.provider_state.format == self.expected_reasoning_format
                     {
@@ -701,6 +769,17 @@ impl Normalizer {
             };
 
             let Some(index) = self.find_pending_call(result) else {
+                if self.pending_calls.iter().any(|call| call.native)
+                    || result
+                        .call_id
+                        .as_ref()
+                        .is_some_and(|id| self.seen_native_ids.contains(id))
+                {
+                    return Err(Error::Normalize(
+                        "orphan_tool_result: native history requires explicit call_id pairing"
+                            .into(),
+                    ));
+                }
                 self.handle_orphan_tool_result(result)?;
                 continue;
             };
@@ -758,6 +837,15 @@ impl Normalizer {
                 return Some(index);
             }
 
+            if self.seen_native_ids.contains(call_id)
+                || self
+                    .pending_calls
+                    .iter()
+                    .any(|call| call.native && !call.fulfilled)
+            {
+                return None;
+            }
+
             // An explicit id is the identity, so it never borrows another call's
             // slot by name. The single exception is a call whose id this run
             // invented: it cannot equal the real provider id the result carries.
@@ -769,7 +857,7 @@ impl Normalizer {
 
         self.pending_calls
             .iter()
-            .position(|call| call.name == result.name && !call.fulfilled)
+            .position(|call| !call.native && call.name == result.name && !call.fulfilled)
     }
 
     fn handle_orphan_tool_result(&mut self, result: &ToolResult) -> Result<()> {
@@ -810,6 +898,16 @@ impl Normalizer {
         if missing.is_empty() {
             self.pending_calls.clear();
             return Ok(());
+        }
+
+        if self
+            .pending_calls
+            .iter()
+            .any(|call| call.native && !call.fulfilled)
+        {
+            return Err(Error::Normalize(
+                "tool_call_incomplete: native tool result missing".into(),
+            ));
         }
 
         match self.options.missing_tool_result {
@@ -922,6 +1020,7 @@ fn normalize_non_tool_parts(parts: &[Part], report: &mut NormalizeReport) -> Vec
                     call.name, call.arguments
                 )))
             }
+            Part::NativeToolCall(_) => None,
             Part::ToolResult(result) => {
                 report
                     .actions

@@ -102,6 +102,51 @@ async fn endpoint_adapter_dispatches_openai_responses() {
 }
 
 #[tokio::test]
+async fn native_custom_call_replays_result_in_next_http_body() {
+    use mutil_ai::{Message, Part, ToolResult};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let patch = "*** Begin Patch\n+你好 \\ path\n*** End Patch\n";
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        read_request(&mut first).await;
+        let response = json!({"status":"completed","output":[{"type":"custom_tool_call","id":"ctc_1","call_id":"call_1","name":"apply_patch","input":patch,"status":"completed"}]}).to_string();
+        write_response(&mut first, "application/json", &response).await;
+        let (mut second, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut second).await;
+        let (_, body) = request_parts(&request);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["input"][1]["type"], "custom_tool_call");
+        assert_eq!(body["input"][1]["id"], "ctc_1");
+        assert_eq!(body["input"][1]["call_id"], "call_1");
+        assert_eq!(body["input"][1]["input"], patch);
+        assert_eq!(
+            body["input"][2],
+            json!({"type":"custom_tool_call_output","call_id":"call_1","output":"denied"})
+        );
+        write_response(&mut second, "application/json", r#"{"output":[]}"#).await;
+    });
+    let endpoint = EndpointSpec::openai_responses(format!("http://{address}/v1"));
+    let model = EndpointAdapter::new("m", endpoint).api_key("test");
+    let first = model.complete(&ChatRequest::user("test")).await.unwrap();
+    assert!(matches!(
+        first.message.parts.first(),
+        Some(Part::NativeToolCall(_))
+    ));
+    let next = ChatRequest::new([
+        Message::user("test"),
+        first.message,
+        Message::tool_results([ToolResult::error(
+            Some("call_1".into()),
+            "apply_patch",
+            "denied",
+        )]),
+    ]);
+    model.complete(&next).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn endpoint_adapter_dispatches_anthropic_messages() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

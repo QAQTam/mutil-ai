@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.7.0 — Native Responses tool declarations and custom tools
+
+### Breaking/source changes
+
+- `Part` adds `NativeToolCall(NativeToolCall)`. Downstream exhaustive matches
+  must add an arm.
+- `StreamEvent` adds `NativeToolProgress { index, item_id, input_so_far }` and
+  `NativeToolCompleted { index, call }`. Downstream exhaustive matches must add
+  arms. `NativeToolProgress` is progress only; `NativeToolCompleted` records
+  item completion, not permission to dispatch a write.
+- `ChatRequest` adds `tool_declarations: Vec<ToolDeclaration>` (serde default:
+  empty). Struct literals without `..Default::default()` must add the field;
+  serialized requests that omit it deserialize as empty.
+
+### Added
+
+- Typed `ToolDeclaration` / `ScopedToolDeclaration` / `CustomToolFormat`
+  (text or grammar) with per-scope name validation via
+  `validate_tool_declarations`.
+- `NativeToolCall` with kind, namespace, name, real `call_id`, optional
+  `item_id`, raw payload, completion and provider state;
+  `NativeToolCall::validate_completed` enforces identity/payload invariants.
+- Responses outbound declarations: flat custom and one-level namespace
+  function/custom. Declarations are accepted only on Responses; Chat,
+  Anthropic Messages and Gemini still fail closed with
+  `unsupported_tool_representation`.
+- Native custom streaming: `CustomToolAccumulator` separates delta fragments
+  from authoritative `done`/full-input snapshots, rejects identity and payload
+  conflicts, and only exposes a completed call after `output_item.done`.
+- Normalizer pairing: completed native calls register pending by the real
+  `call_id`; results replay as `custom_tool_call_output` or
+  `function_call_output` according to the original kind. Missing or orphan
+  native results are explicit errors, and opaque client tool items are
+  rejected instead of being double-encoded.
+- Namespaced function calls preserve namespace/name/item identity and are
+  backfilled from `output_item.done` when the terminal response omits the item.
+- Native replay preserves provider state and completion status instead of
+  reconstructing a minimal item.
+- Public `CustomToolAccumulator` / `NativeToolIdentity` for callers that need
+  protocol-level progress inspection.
+- Tests: declaration encoding, non-Responses rejection, custom stream
+  snapshot/conflict handling, namespaced function terminal backfill, mixed
+  legacy/native pairing, and a loopback HTTP custom-call + error-result replay.
+
+### Notes
+
+- Native declarations are opt-in; no default wire or tool layout changes.
+- No real-provider/OAuth capability is claimed by this release, and no Codex
+  grammar is bundled in the SDK. Applications must still enforce cancellation,
+  permission and write-scheduling policy before executing native calls.
+
 ## 0.6.1 — SSE tail flush (recover the final event on gateway-cut streams)
 
 ### Added

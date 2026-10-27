@@ -21,6 +21,7 @@ mod blocking;
 mod cancel;
 mod error;
 mod headers;
+mod native_tool_stream;
 mod normalize;
 mod profile;
 mod report;
@@ -47,6 +48,7 @@ pub use headers::{
     ClientInfo, HeaderInjector, HeaderPolicy, RequestContext, RequestOptions, SDK_USER_AGENT,
     TransportConfig, apply_headers,
 };
+pub use native_tool_stream::{CustomToolAccumulator, NativeToolIdentity};
 pub use normalize::{
     ExternalRole, MissingToolResultPolicy, NormalizeAction, NormalizeOptions, NormalizeReport,
     NormalizeStats, NormalizedChat, NormalizedMessage, OrphanToolResultPolicy, Protocol,
@@ -72,9 +74,10 @@ pub use stream::{
 };
 pub use transform::RequestTransform;
 pub use types::{
-    ChatRequest, ChatResponse, ImageDetail, ImagePart, ImageSource, ImageUrl, Message, Part,
+    ChatRequest, ChatResponse, CustomToolFormat, ImageDetail, ImagePart, ImageSource, ImageUrl,
+    Message, NativeToolCall, NativeToolCompletion, NativeToolKind, NativeToolPayload, Part,
     ProviderState, ProviderStateFormat, Reasoning, ReasoningConfig, ReasoningEffort, ReasoningKind,
-    ReasoningMode, ReasoningSummary, ResponseFormat, ResponseMetadata, Role, ServerTool,
-    ServerToolItem, ServerToolState, ToolCall, ToolChoice, ToolResult, ToolResultPart, ToolSpec,
-    Usage,
+    ReasoningMode, ReasoningSummary, ResponseFormat, ResponseMetadata, Role, ScopedToolDeclaration,
+    ServerTool, ServerToolItem, ServerToolState, ToolCall, ToolChoice, ToolDeclaration, ToolResult,
+    ToolResultPart, ToolSpec, Usage, validate_tool_declarations,
 };
