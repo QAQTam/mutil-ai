@@ -11,6 +11,12 @@
 
 ## 安装
 
+**0.7.0：** 原生 Responses 工具声明（flat custom 与一层 namespace function/custom）及 custom 调用流式/回放。声明为 opt-in 且仅 Responses 接受；Chat、Anthropic Messages、Gemini 仍显式拒绝。见 [docs/migration-0.7.md](docs/migration-0.7.md) 与 [CHANGELOG.md](CHANGELOG.md)。
+
+**0.6.1：** SSE tail-flush 策略，在网关截断流时恢复最后一个事件。见 [CHANGELOG.md](CHANGELOG.md)。
+
+**0.6.0：** 新增 `ultra` reasoning 档；`ReasoningEffort` 的穷尽 match 需要补分支。见 [CHANGELOG.md](CHANGELOG.md)。
+
 **0.5.1：** `tool_call_content` 各模式不再丢弃 `tool_calls` 旁的非空 assistant 文本——只按文档承诺整形空 content。见 [CHANGELOG.md](CHANGELOG.md)。
 
 **0.5.0：** 修正工具配对：call id 正确但工具名不一致时，不再丢弃真实工具输出。见 [docs/migration-0.5.md](docs/migration-0.5.md)。
@@ -27,6 +33,26 @@ cargo add mutil-ai
 - 最低 Rust 版本(MSRV):**1.97.1**(见 `Cargo.toml` 的 `rust-version`)
 - 可选 feature:`blocking`(提供阻塞式 `BlockingAdapter` / `BlockingStream`)
 - 许可:MIT OR Apache-2.0（任选一种）
+
+### 原生工具声明（0.7.0，opt-in）
+
+`ChatRequest::tool_declarations` 承载 typed 客户端工具声明。下面是一个在 `Protocol::OpenAiResponses` 上可用的 flat custom 示例：
+
+```rust
+use mutil_ai::{ChatRequest, CustomToolFormat, ScopedToolDeclaration, ToolDeclaration};
+
+let request = ChatRequest::user("apply the patch").tool_declarations([
+    ToolDeclaration::Tool {
+        tool: ScopedToolDeclaration::Custom {
+            name: "apply_patch".into(),
+            description: "Apply a raw patch".into(),
+            format: CustomToolFormat::Text,
+        },
+    },
+]);
+```
+
+一层作用域可用 `ToolDeclaration::Namespace` 混合 function/custom；不支持嵌套 namespace。`CustomToolFormat::Grammar { syntax, definition }` 由调用方提供完整 grammar，SDK 不内置 Codex grammar。其他 wire 不接受这些声明。
 
 
 它的目标不是一次支持所有高级功能，而是先回答一个关键问题：
@@ -62,6 +88,11 @@ SDK 的长期契约、当前实现和交接清单见：
 当前版本的实现交接见：
 
 - [`docs/handoff-0.2.md`](docs/handoff-0.2.md)
+
+原生 Responses 工具面（0.7.0）见：
+
+- [`docs/native-tool-handoff.md`](docs/native-tool-handoff.md)
+- [`docs/native-tool-progress.md`](docs/native-tool-progress.md)
 
 下游 gateway / agent 的通用扩展能力登记见：
 
@@ -1182,7 +1213,7 @@ examples/
 
 ## 12. 当前版本刻意不做的内容
 
-这是 v0.5.0,目前优先把 role、工具配对、retry、SSE、reasoning、统一
+这是 v0.7.0,目前优先把 role、工具配对、retry、SSE、reasoning、统一
 streaming、取消和通用 provider 扩展边界讲清楚，因此暂时不做：
 
 - WebSocket / Realtime

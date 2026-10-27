@@ -768,7 +768,7 @@ impl ToolSpec {
 
 /// Input accepted by a client-executed custom tool.
 ///
-/// Native declarations remain gated until call and replay support is complete.
+/// Native declarations are accepted on Responses; other wires reject them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CustomToolFormat {
@@ -785,8 +785,8 @@ pub enum CustomToolFormat {
 
 /// A client-executed tool within a declaration scope.
 ///
-/// Unlike [`ServerTool`], custom tools are executed by the application. This
-/// Native declarations remain gated until streaming and replay are complete.
+/// Unlike [`ServerTool`], custom tools are executed by the application.
+/// Native declarations are Responses-only; other wires reject them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScopedToolDeclaration {
@@ -818,8 +818,8 @@ impl From<ToolSpec> for ScopedToolDeclaration {
 
 /// A flat client tool or a single-level namespace of client tools.
 ///
-/// Requests containing these declarations are currently rejected until native
-/// call decoding and result replay can be supported safely.
+/// Requests containing these declarations are accepted only on Responses;
+/// other wires reject them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolDeclaration {
@@ -896,8 +896,8 @@ pub enum NativeToolCompletion {
 
 /// Original call identity and input, independent of a canonical tool call.
 ///
-/// This is not yet integrated with message normalization or stream decoding;
-/// consumers must not treat the presence of this type as execution support.
+/// Normalization and stream decoding produce these calls; their presence still
+/// does not grant permission to execute a write.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeToolCall {
     pub kind: NativeToolKind,

@@ -11,6 +11,18 @@ A provider-neutral model-invocation SDK for Rust beginners.
 
 ## Installation
 
+**0.7.0:** native Responses tool declarations (flat custom and one-level
+namespace function/custom) plus custom-call streaming and replay. Declarations
+are opt-in and Responses-only; Chat, Anthropic Messages and Gemini still reject
+them. See [docs/migration-0.7.md](docs/migration-0.7.md) and
+[CHANGELOG.md](CHANGELOG.md).
+
+**0.6.1:** SSE tail-flush policy recovers the final event on gateway-cut
+streams. See [CHANGELOG.md](CHANGELOG.md).
+
+**0.6.0:** adds the `ultra` reasoning tier; exhaustive `ReasoningEffort`
+matches need an arm. See [CHANGELOG.md](CHANGELOG.md).
+
 **0.5.1:** `tool_call_content` modes no longer drop non-empty assistant content
 next to `tool_calls` — they only shape empty content, as documented. See
 [CHANGELOG.md](CHANGELOG.md).
@@ -31,6 +43,30 @@ cargo add mutil-ai
 - Minimum supported Rust version (MSRV): **1.97.1** (see `rust-version` in `Cargo.toml`)
 - Optional feature: `blocking` (provides the blocking `BlockingAdapter` / `BlockingStream`)
 - License: MIT OR Apache-2.0 (choose either)
+
+### Native tool declarations (0.7.0, opt-in)
+
+`ChatRequest::tool_declarations` carries typed client-tool declarations. The
+following flat custom tool is accepted on `Protocol::OpenAiResponses`:
+
+```rust
+use mutil_ai::{ChatRequest, CustomToolFormat, ScopedToolDeclaration, ToolDeclaration};
+
+let request = ChatRequest::user("apply the patch").tool_declarations([
+    ToolDeclaration::Tool {
+        tool: ScopedToolDeclaration::Custom {
+            name: "apply_patch".into(),
+            description: "Apply a raw patch".into(),
+            format: CustomToolFormat::Text,
+        },
+    },
+]);
+```
+
+Use `ToolDeclaration::Namespace` for one level of scoped function/custom tools;
+nested namespaces are not represented. `CustomToolFormat::Grammar { syntax,
+definition }` passes a caller-supplied complete grammar. Declarations are not
+accepted on other wires, and the SDK does not bundle the Codex grammar.
 
 
 Its goal is not to support every advanced feature at once, but to answer one key question first:
@@ -63,6 +99,11 @@ For frozen candidate API semantics intended to help teams evaluate adoption, see
 For the implementation handoff of the current version, see:
 
 - [`docs/handoff-0.2.md`](docs/handoff-0.2.md)
+
+For the native Responses tool surface (0.7.0), see:
+
+- [`docs/native-tool-handoff.md`](docs/native-tool-handoff.md)
+- [`docs/native-tool-progress.md`](docs/native-tool-progress.md)
 
 For a registry of generic extension capabilities required by downstream gateways / agents, see:
 
@@ -1134,7 +1175,11 @@ Key point: **role conversion, tool repairs, and cross-provider reasoning cleanup
 
 ## 12. What the current version deliberately does not do
 
-This is v0.5.0; the current priority is getting roles, tool pairing, retry, SSE, reasoning, unified streaming, cancellation, and the generic provider extension boundary clearly defined. For now, the following are out of scope:
+This is v0.7.0; the current priority is getting roles, tool pairing, retry, SSE,
+reasoning, unified streaming, cancellation, and the generic provider extension
+boundary clearly defined. Native tool declarations are available as an opt-in
+Responses-only surface; they do not change the default wire or tool layout. For
+now, the following are out of scope:
 
 - WebSocket / Realtime
 - OpenAI Responses' `previous_response_id` / `store`
@@ -1142,6 +1187,8 @@ This is v0.5.0; the current priority is getting roles, tool pairing, retry, SSE,
 - Gemini Interactions API
 - embedding / rerank / speech
 - Automatically translating reasoning between different providers; the current choice is to safely drop it rather than guess
+- Automatic fallback of native declarations to other wires, or claiming
+  real-provider/OAuth capability without endpoint probes
 
 All of these can be added later — but they should be added in clearly defined places, not by stuffing provider special cases into the downstream runtime or the example Agent loop.
 
