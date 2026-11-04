@@ -21,6 +21,7 @@ mod blocking;
 mod cancel;
 mod error;
 mod headers;
+pub mod lenient;
 mod native_tool_stream;
 mod normalize;
 mod profile;

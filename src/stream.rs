@@ -120,6 +120,12 @@ pub enum StreamEvent {
     NativeToolProgress {
         index: usize,
         item_id: Option<String>,
+        /// Canonical call id when the provider has already announced it.
+        call_id: Option<String>,
+        /// Tool name when the provider has already announced it.
+        name: Option<String>,
+        /// The exact fragment carried by this delta frame.
+        delta: String,
         input_so_far: String,
     },
     /// A completed native item. Applications must still apply cancellation and

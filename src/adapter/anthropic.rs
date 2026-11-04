@@ -993,7 +993,7 @@ fn merge_usage_raw(current: Option<Value>, next: &Value) -> Value {
 }
 
 fn parse_json_or_string(value: &str) -> Value {
-    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
+    crate::lenient::value_or_string(value)
 }
 
 pub(crate) fn from_anthropic_response(value: Value) -> Result<ChatResponse> {

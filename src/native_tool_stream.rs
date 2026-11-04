@@ -109,6 +109,16 @@ impl CustomToolAccumulator {
         &self.input
     }
 
+    /// Canonical call id, once an item/added frame has supplied it.
+    pub fn call_id(&self) -> Option<&str> {
+        self.identity.call_id.as_deref()
+    }
+
+    /// Tool name, once an item/added frame has supplied it.
+    pub fn name(&self) -> Option<&str> {
+        self.identity.name.as_deref()
+    }
+
     /// Whether a completed item snapshot was observed.
     pub fn is_completed(&self) -> bool {
         self.item_completed && !self.invalid

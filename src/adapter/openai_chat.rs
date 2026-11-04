@@ -1438,7 +1438,7 @@ fn openai_chat_usage_value(usage: &Value) -> Usage {
 }
 
 fn parse_json_or_string(value: &str) -> Value {
-    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
+    crate::lenient::value_or_string(value)
 }
 
 fn openai_chat_reasoning_effort(config: Option<&ReasoningConfig>) -> Option<&'static str> {

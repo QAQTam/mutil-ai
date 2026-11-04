@@ -373,8 +373,14 @@ fn responses_declaration(declaration: &ToolDeclaration) -> Value {
                 description,
                 format,
             } => {
-                let mut result =
-                    json!({"type": "custom", "name": name, "description": description});
+                let mut result = json!({"type": "custom", "name": name});
+                // DeepSeek documents the custom tool as exactly
+                // `{"type":"custom","name":"apply_patch"}`. An empty description
+                // is the explicit signal to emit that minimal shape; other
+                // providers keep the Codex description/grammar.
+                if !description.is_empty() {
+                    result["description"] = json!(description);
+                }
                 if let CustomToolFormat::Grammar { syntax, definition } = format {
                     result["format"] =
                         json!({"type": "grammar", "syntax": syntax, "definition": definition});
@@ -770,7 +776,43 @@ impl ResponsesStreamMapper {
         let mut events = Vec::new();
         self.push_start(&mut events);
 
-        if let Some(output) = response.get("output").and_then(Value::as_array) {
+        // Some compatible endpoints (notably DeepSeek) document the custom
+        // tool-call output item without an `input` field. The streamed
+        // `custom_tool_call_input.delta` / `.done` frames are then the only
+        // authoritative payload. Inject the accumulated snapshot before both
+        // the accumulator reconciliation and `from_responses_response` parse
+        // the terminal item, so a completed call is not lost.
+        let mut normalized_response = response.clone();
+        if let Some(output) = normalized_response
+            .get_mut("output")
+            .and_then(Value::as_array_mut)
+        {
+            for (index, item) in output.iter_mut().enumerate() {
+                if item.get("type").and_then(Value::as_str) != Some("custom_tool_call") {
+                    continue;
+                }
+                let has_input = item
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .is_some_and(|input| !input.is_empty());
+                if has_input {
+                    continue;
+                }
+                let Some(streamed) = self
+                    .custom_calls
+                    .get(&index)
+                    .map(|call| call.input())
+                    .filter(|input| !input.is_empty())
+                else {
+                    continue;
+                };
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("input".to_owned(), Value::String(streamed.to_owned()));
+                }
+            }
+        }
+
+        if let Some(output) = normalized_response.get("output").and_then(Value::as_array) {
             for (index, item) in output.iter().enumerate() {
                 if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
                     let call = parse_custom_item(item)?;
@@ -790,7 +832,7 @@ impl ResponsesStreamMapper {
         if self.custom_calls.values().any(|call| !call.is_completed()) {
             return Err(Error::StreamProtocol("tool_call_incomplete".into()));
         }
-        let mut normalized = from_responses_response(response.clone())?;
+        let mut normalized = from_responses_response(normalized_response)?;
         let mut terminal_ids = std::collections::HashSet::new();
         for part in &normalized.message.parts {
             let id = match part {
@@ -1091,6 +1133,9 @@ impl SseMapper for ResponsesStreamMapper {
                     events.push(StreamEvent::NativeToolProgress {
                         index,
                         item_id,
+                        call_id: call.call_id().map(str::to_string),
+                        name: call.name().map(str::to_string),
+                        delta: delta.to_string(),
                         input_so_far: call.input().to_owned(),
                     });
                 } else {
@@ -1253,7 +1298,13 @@ impl SseMapper for ResponsesStreamMapper {
                 }
                 match item.get("type").and_then(Value::as_str) {
                     Some("custom_tool_call") => {
-                        let parsed = parse_custom_item(item)?;
+                        let fallback_input = self
+                            .custom_calls
+                            .get(&output_index)
+                            .map(|call| call.input().to_owned())
+                            .filter(|input| !input.is_empty());
+                        let parsed =
+                            parse_custom_item_with_fallback(item, fallback_input.as_deref())?;
                         if self.parts.contains_key(&output_index) {
                             return Err(Error::StreamProtocol(
                                 "tool_identity_conflict: output index reused".into(),
@@ -1503,6 +1554,29 @@ fn parse_custom_item(item: &Value) -> Result<NativeToolCall> {
     Ok(call)
 }
 
+/// Parse a completed custom item, allowing a streamed snapshot to stand in
+/// when the terminal item omits `input` (DeepSeek's documented item shape).
+fn parse_custom_item_with_fallback(
+    item: &Value,
+    fallback_input: Option<&str>,
+) -> Result<NativeToolCall> {
+    let has_input = item
+        .get("input")
+        .and_then(Value::as_str)
+        .is_some_and(|input| !input.is_empty());
+    if has_input || fallback_input.is_none_or(str::is_empty) {
+        return parse_custom_item(item);
+    }
+    let mut patched = item.clone();
+    if let Some(object) = patched.as_object_mut() {
+        object.insert(
+            "input".to_owned(),
+            Value::String(fallback_input.unwrap_or_default().to_owned()),
+        );
+    }
+    parse_custom_item(&patched)
+}
+
 fn custom_identity(item: &Value) -> NativeToolIdentity {
     let get = |key: &str| item.get(key).and_then(Value::as_str).map(str::to_string);
     NativeToolIdentity {
@@ -1650,7 +1724,7 @@ fn responses_usage(usage: &Value) -> Usage {
 }
 
 fn parse_json_or_string(value: &str) -> Value {
-    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
+    crate::lenient::value_or_string(value)
 }
 
 fn responses_reasoning(config: Option<&ReasoningConfig>) -> Option<Value> {
@@ -1795,6 +1869,18 @@ mod tests {
             json!({
                 "type":"custom", "name":"apply_patch", "description":"apply"
             })
+        );
+        let minimal = ToolDeclaration::Tool {
+            tool: ScopedToolDeclaration::Custom {
+                name: "apply_patch".into(),
+                description: String::new(),
+                format: CustomToolFormat::Text,
+            },
+        };
+        assert_eq!(
+            responses_declaration(&minimal),
+            json!({"type":"custom", "name":"apply_patch"}),
+            "DeepSeek's documented custom shape carries only type/name"
         );
         let namespace = ToolDeclaration::Namespace {
             name: "functions".into(),
@@ -1985,6 +2071,106 @@ mod tests {
                 json!({"type":"response.completed", "response":{"output":[]}})
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn custom_terminal_item_without_input_uses_streamed_snapshot() {
+        fn send(mapper: &mut ResponsesStreamMapper, event: Value) -> Result<Vec<StreamEvent>> {
+            mapper.map(SseMessage {
+                event: None,
+                data: event.to_string(),
+                id: None,
+            })
+        }
+        fn mapper() -> ResponsesStreamMapper {
+            ResponsesStreamMapper::new(
+                "m".into(),
+                ResponseMetadata {
+                    status: 200,
+                    request_id: None,
+                    headers: HeaderMap::new(),
+                },
+            )
+        }
+        let patch = "*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch";
+        let added = json!({"type":"response.output_item.added", "output_index":0, "item":{"type":"custom_tool_call","id":"ctc_1","call_id":"call_1","name":"apply_patch","input":"","status":"in_progress"}});
+        let delta = json!({"type":"response.custom_tool_call_input.delta","output_index":0,"item_id":"ctc_1","delta":patch});
+        let input_done = json!({"type":"response.custom_tool_call_input.done","output_index":0,"item_id":"ctc_1","input":patch});
+
+        let mut terminal_mapper = mapper();
+        send(&mut terminal_mapper, added.clone()).unwrap();
+        let progress = send(&mut terminal_mapper, delta.clone()).unwrap();
+        let (call_id, name, fragment) = progress
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::NativeToolProgress {
+                    call_id,
+                    name,
+                    delta,
+                    ..
+                } => Some((call_id.clone(), name.clone(), delta.clone())),
+                _ => None,
+            })
+            .expect("custom delta must surface as NativeToolProgress");
+        assert_eq!(
+            (call_id.as_deref(), name.as_deref(), fragment.as_str()),
+            (Some("call_1"), Some("apply_patch"), patch)
+        );
+        send(&mut terminal_mapper, input_done.clone()).unwrap();
+        let terminal = send(
+            &mut terminal_mapper,
+            json!({"type":"response.completed", "response":{"output":[{
+                "type":"custom_tool_call", "id":"ctc_1", "call_id":"call_1",
+                "name":"apply_patch", "status":"completed"
+            }]}}),
+        )
+        .unwrap();
+        let response = terminal
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Done { response, .. } => Some(response),
+                _ => None,
+            })
+            .expect("completed response");
+        let call = response
+            .message
+            .parts
+            .iter()
+            .find_map(|part| match part {
+                Part::NativeToolCall(call) => Some(call),
+                _ => None,
+            })
+            .expect("custom call must survive a terminal item without input");
+        assert!(
+            matches!(&call.payload, NativeToolPayload::RawText(input) if input == patch),
+            "terminal item must inherit the streamed input: {:?}",
+            call.payload
+        );
+
+        let mut done_mapper = mapper();
+        send(&mut done_mapper, added).unwrap();
+        send(&mut done_mapper, delta).unwrap();
+        send(&mut done_mapper, input_done).unwrap();
+        let done = send(
+            &mut done_mapper,
+            json!({"type":"response.output_item.done", "output_index":0, "item":{
+                "type":"custom_tool_call", "id":"ctc_1", "call_id":"call_1",
+                "name":"apply_patch", "status":"completed"
+            }}),
+        )
+        .unwrap();
+        let call = done
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::NativeToolCompleted { call, .. } => Some(call),
+                _ => None,
+            })
+            .expect("output_item.done must complete the call");
+        assert!(
+            matches!(&call.payload, NativeToolPayload::RawText(input) if input == patch),
+            "output_item.done must inherit the streamed input: {:?}",
+            call.payload
         );
     }
 
