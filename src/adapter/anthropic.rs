@@ -430,6 +430,12 @@ pub(crate) fn to_anthropic_body(
         }
     }
 
+    // Exactly one message-level marker per request, on the last cacheable
+    // block of the trailing message (walk back past thinking-only tails).
+    if request.prompt_cache {
+        mark_last_cacheable_block(&mut messages);
+    }
+
     let mut body = json!({
         "model": model,
         "max_tokens": request.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
@@ -437,22 +443,40 @@ pub(crate) fn to_anthropic_body(
     });
 
     if let Some(system) = &normalized.system {
-        body["system"] = json!(system);
+        // Explicit breakpoints require the array form of `system`; the plain
+        // string shape must stay byte-identical when caching is off.
+        body["system"] = if request.prompt_cache {
+            json!([{
+                "type": "text",
+                "text": system,
+                "cache_control": ephemeral_marker(),
+            }])
+        } else {
+            json!(system)
+        };
     }
     if !normalized.tools.is_empty() {
-        body["tools"] = Value::Array(
-            normalized
-                .tools
-                .iter()
-                .map(|tool| {
-                    json!({
-                        "name": tool.name,
-                        "description": tool.description,
-                        "input_schema": tool.parameters,
-                    })
+        let mut tools: Vec<Value> = normalized
+            .tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.parameters,
                 })
-                .collect(),
-        );
+            })
+            .collect();
+        // One marker on the last tool caches the whole tools section; later
+        // additions must append after it so toggling them only churns the
+        // small tail (Claude Code's ordering discipline).
+        if request.prompt_cache
+            && let Some(last) = tools.last_mut()
+            && let Some(object) = last.as_object_mut()
+        {
+            object.insert("cache_control".to_string(), ephemeral_marker());
+        }
+        body["tools"] = Value::Array(tools);
     }
     if let Some(temperature) = request.temperature {
         body["temperature"] = json!(temperature);
@@ -510,6 +534,35 @@ fn push_anthropic_message(messages: &mut Vec<Value>, role: &str, blocks: Vec<Val
     }
 
     messages.push(json!({"role": role, "content": blocks}));
+}
+
+fn ephemeral_marker() -> Value {
+    json!({ "type": "ephemeral" })
+}
+
+/// Places a single `cache_control` marker on the last cacheable content block,
+/// walking backwards across messages: Anthropic rejects breakpoints on
+/// `thinking`/`redacted_thinking`, so a thinking-only tail must not swallow the
+/// breakpoint entirely.
+fn mark_last_cacheable_block(messages: &mut [Value]) {
+    const CACHEABLE: [&str; 5] = ["text", "image", "document", "tool_result", "tool_use"];
+    for message in messages.iter_mut().rev() {
+        let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in blocks.iter_mut().rev() {
+            let cacheable = block
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| CACHEABLE.contains(&kind));
+            if cacheable {
+                if let Some(object) = block.as_object_mut() {
+                    object.insert("cache_control".to_string(), ephemeral_marker());
+                }
+                return;
+            }
+        }
+    }
 }
 
 fn anthropic_content(parts: &[Part]) -> Vec<Value> {
@@ -1103,6 +1156,76 @@ mod tests {
         assert_eq!(body["tool_choice"]["type"], "tool");
         assert_eq!(body["tool_choice"]["name"], "lookup");
         assert_eq!(body["stop_sequences"], json!(["END"]));
+    }
+
+    #[test]
+    fn prompt_cache_places_three_ephemeral_breakpoints() {
+        let thinking_tail = from_anthropic_response(json!({
+            "content": [{"type": "thinking", "thinking": "tail", "signature": "s"}]
+        }))
+        .unwrap()
+        .message;
+        let request = ChatRequest::new([
+            Message::system("terse"),
+            Message::user("weather paris?"),
+            Message::assistant_with_tools(
+                "",
+                [ToolCall::new("lookup", json!({"city": "Paris"})).with_id("call-1")],
+            ),
+            thinking_tail,
+        ])
+        .tools([
+            crate::types::ToolSpec::new("lookup", "lookup", json!({"type": "object"})),
+            crate::types::ToolSpec::new("other", "other", json!({"type": "object"})),
+        ])
+        .prompt_cache(true);
+        let (normalized, _) = normalize(&request, Protocol::AnthropicMessages).unwrap();
+        let body = to_anthropic_body("claude", &normalized, &request);
+
+        assert_eq!(
+            body["system"],
+            json!([{
+                "type": "text",
+                "text": "terse",
+                "cache_control": {"type": "ephemeral"},
+            }])
+        );
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+
+        // Exactly one message-level marker; the thinking tail cannot hold it,
+        // and the normalizer pairs the dangling tool_use with a synthesized
+        // tool_result, so the marker lands on that final cacheable block.
+        let marked: Vec<&Value> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| m["content"].as_array().unwrap().iter())
+            .filter(|b| b.get("cache_control").is_some())
+            .collect();
+        assert_eq!(marked.len(), 1);
+        assert_eq!(marked[0]["type"], "tool_result");
+    }
+
+    #[test]
+    fn prompt_cache_off_keeps_wire_shape_unchanged() {
+        let request = ChatRequest::new([Message::system("terse"), Message::user("hi")]).tools([
+            crate::types::ToolSpec::new("lookup", "lookup", json!({"type": "object"})),
+        ]);
+        let (normalized, _) = normalize(&request, Protocol::AnthropicMessages).unwrap();
+        let body = to_anthropic_body("claude", &normalized, &request);
+        assert_eq!(body["system"], json!("terse"));
+        assert!(body["tools"][0].get("cache_control").is_none());
+        let any_marker = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| m["content"].as_array().unwrap().iter())
+            .any(|b| b.get("cache_control").is_some());
+        assert!(!any_marker);
     }
 
     #[test]

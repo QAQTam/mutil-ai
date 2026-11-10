@@ -1115,6 +1115,12 @@ pub struct ChatRequest {
     pub max_output_tokens: Option<u32>,
     /// Reasoning behavior, for providers that support it.
     pub reasoning: Option<ReasoningConfig>,
+    /// Anthropic Messages wire only: emit explicit `{"type":"ephemeral"}`
+    /// cache breakpoints on the last tool spec, the system block, and the
+    /// last cacheable content block of the trailing message (three markers,
+    /// inside the four-marker protocol budget). Other wires ignore this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prompt_cache: bool,
     /// Escape hatch for provider-specific wire fields. Reserved canonical
     /// fields cannot be overwritten.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
@@ -1185,6 +1191,12 @@ impl ChatRequest {
     /// Sets the sampling seed.
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
+        self
+    }
+
+    /// Enables explicit Anthropic-style prompt-cache breakpoints.
+    pub fn prompt_cache(mut self, enabled: bool) -> Self {
+        self.prompt_cache = enabled;
         self
     }
 
