@@ -1213,12 +1213,11 @@ examples/
 
 ## 12. 当前版本刻意不做的内容
 
-这是 v0.7.0,目前优先把 role、工具配对、retry、SSE、reasoning、统一
+这是 v0.8.0，目前优先把 role、工具配对、retry、SSE、reasoning、统一
 streaming、取消和通用 provider 扩展边界讲清楚，因此暂时不做：
 
 - WebSocket / Realtime
 - OpenAI Responses 的 `previous_response_id` / `store`
-- Anthropic `cache_control`
 - Gemini Interactions API
 - embedding / rerank / speech
 - 自动把不同 provider 的 reasoning 互译；当前选择安全丢弃，而不是猜测

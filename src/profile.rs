@@ -902,10 +902,7 @@ pub enum ThinkingRequestProfile {
     /// Static fields are applied even when the request has no
     /// `ReasoningConfig`; dynamic thinking controls are still ignored unless a
     /// config is present.
-    Field {
-        path: String,
-        value: Value,
-    },
+    Field { path: String, value: Value },
     /// Applies several encodings together, in order.
     Composite(Vec<ThinkingRequestProfile>),
 }

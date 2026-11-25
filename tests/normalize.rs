@@ -297,15 +297,17 @@ fn system_placement_first_to_top_rest_in_place_keeps_later_injections() {
     let roles: Vec<ExternalRole> = normalized.messages.iter().map(|m| m.role.clone()).collect();
     assert_eq!(
         roles,
-        vec![ExternalRole::User, ExternalRole::Developer, ExternalRole::System]
+        vec![
+            ExternalRole::User,
+            ExternalRole::Developer,
+            ExternalRole::System
+        ]
     );
 }
 
 #[test]
 fn system_placement_default_merges_everything_to_top() {
-    use mutil_ai::{
-        ChatRequest, Message, NormalizeOptions, Protocol, normalize_with_options,
-    };
+    use mutil_ai::{ChatRequest, Message, NormalizeOptions, Protocol, normalize_with_options};
     let request = ChatRequest::new(vec![
         Message::system("base"),
         Message::user("hi"),

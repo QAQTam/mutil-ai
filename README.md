@@ -1175,7 +1175,7 @@ Key point: **role conversion, tool repairs, and cross-provider reasoning cleanup
 
 ## 12. What the current version deliberately does not do
 
-This is v0.7.0; the current priority is getting roles, tool pairing, retry, SSE,
+This is v0.8.0; the current priority is getting roles, tool pairing, retry, SSE,
 reasoning, unified streaming, cancellation, and the generic provider extension
 boundary clearly defined. Native tool declarations are available as an opt-in
 Responses-only surface; they do not change the default wire or tool layout. For

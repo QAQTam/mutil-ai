@@ -48,7 +48,9 @@ pub fn repair(value: &str) -> Option<String> {
     if repaired == trimmed {
         return None;
     }
-    serde_json::from_str::<Value>(&repaired).ok().map(|_| repaired)
+    serde_json::from_str::<Value>(&repaired)
+        .ok()
+        .map(|_| repaired)
 }
 
 /// Single-pass rewriter over the raw bytes of a JSON document.
@@ -171,10 +173,8 @@ fn quote_bareword_value(bytes: &[u8], start: usize, out: &mut String) -> usize {
     let Some(&first) = bytes.get(i) else {
         return i;
     };
-    let well_formed = matches!(
-        first,
-        b'"' | b'\'' | b'{' | b'[' | b'-' | b'0'..=b'9'
-    ) || bytes[i..].starts_with(b"true")
+    let well_formed = matches!(first, b'"' | b'\'' | b'{' | b'[' | b'-' | b'0'..=b'9')
+        || bytes[i..].starts_with(b"true")
         || bytes[i..].starts_with(b"false")
         || bytes[i..].starts_with(b"null");
     if well_formed {

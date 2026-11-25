@@ -368,9 +368,7 @@ pub(crate) fn apply_provider_request_options(
             .iter()
             .enumerate()
             .filter(|(_, m)| m.get("tool_calls").is_some_and(Value::is_array))
-            .filter(|(_, m)| {
-                matches!(m.get("content"), Some(Value::String(s)) if !s.is_empty())
-            })
+            .filter(|(_, m)| matches!(m.get("content"), Some(Value::String(s)) if !s.is_empty()))
             .map(|(i, _)| i)
             .collect();
         for message in messages.iter_mut() {
@@ -1165,4 +1163,3 @@ mod tool_call_content_tests {
         }
     }
 }
-

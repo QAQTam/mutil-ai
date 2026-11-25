@@ -65,7 +65,12 @@ fn opaque_client_calls_are_rejected_even_when_a_typed_call_exists() {
     use mutil_ai::{ProviderState, ProviderStateFormat, ServerToolItem};
     use serde_json::json;
 
-    for kind in ["function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output"] {
+    for kind in [
+        "function_call",
+        "custom_tool_call",
+        "function_call_output",
+        "custom_tool_call_output",
+    ] {
         let raw = Part::ProviderItem(ServerToolItem::new(ProviderState::new(
             ProviderStateFormat::OpenAiResponses,
             json!({"type": kind, "call_id": "call_1", "name": "apply_patch"}),
@@ -80,10 +85,13 @@ fn opaque_client_calls_are_rejected_even_when_a_typed_call_exists() {
 #[test]
 fn mixed_legacy_and_native_calls_pair_by_id_without_relabeling() {
     use mutil_ai::ToolCall;
-    let legacy = ToolCall::new("apply_patch", serde_json::json!({"patch": "old"}))
-        .with_id("legacy_1");
+    let legacy =
+        ToolCall::new("apply_patch", serde_json::json!({"patch": "old"})).with_id("legacy_1");
     let request = ChatRequest::new([
-        Message::new(Role::Assistant, vec![Part::ToolCall(legacy), Part::NativeToolCall(call())]),
+        Message::new(
+            Role::Assistant,
+            vec![Part::ToolCall(legacy), Part::NativeToolCall(call())],
+        ),
         Message::tool_results([
             ToolResult::new(Some("call_1".into()), "apply_patch", "denied"),
             ToolResult::new(Some("legacy_1".into()), "apply_patch", "ok"),
@@ -91,7 +99,14 @@ fn mixed_legacy_and_native_calls_pair_by_id_without_relabeling() {
     ]);
     let (normalized, _) = normalize(&request, Protocol::OpenAiResponses).unwrap();
     assert!(matches!(normalized.messages[0].parts[0], Part::ToolCall(_)));
-    assert!(matches!(normalized.messages[0].parts[1], Part::NativeToolCall(_)));
-    assert!(matches!(&normalized.messages[1].parts[0], Part::ToolResult(result) if result.call_id.as_deref() == Some("call_1") && result.content == "denied"));
-    assert!(matches!(&normalized.messages[1].parts[1], Part::ToolResult(result) if result.call_id.as_deref() == Some("legacy_1") && result.content == "ok"));
+    assert!(matches!(
+        normalized.messages[0].parts[1],
+        Part::NativeToolCall(_)
+    ));
+    assert!(
+        matches!(&normalized.messages[1].parts[0], Part::ToolResult(result) if result.call_id.as_deref() == Some("call_1") && result.content == "denied")
+    );
+    assert!(
+        matches!(&normalized.messages[1].parts[1], Part::ToolResult(result) if result.call_id.as_deref() == Some("legacy_1") && result.content == "ok")
+    );
 }

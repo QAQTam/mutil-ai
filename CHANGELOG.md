@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.0 — Anthropic ephemeral prompt caching & relaxed tool-argument parsing
+
+### Added
+
+- `ChatRequest.prompt_cache`: places up to three explicit `cache_control`
+  (`ephemeral`) breakpoints on the Anthropic Messages wire (array-form system
+  block, last tool spec, and the last cacheable content block, walking back
+  past trailing thinking blocks). Wire shape stays byte-identical when off.
+- `lenient` JSON repair helper for relaxed tool-call argument strings across
+  Chat, Anthropic, and Responses adapters.
+
+### Fixed
+
+- Custom tool stream snapshot reconciliation and progress delta handling in
+  `openai_responses` and `native_tool_stream`.
+- Formatting and test hygiene across adapters and integration suites.
+
 ## 0.7.0 — Native Responses tool declarations and custom tools
 
 ### Breaking/source changes
